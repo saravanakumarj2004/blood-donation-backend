@@ -6,4 +6,6 @@ pymongo
 python-dotenv
 gunicorn
 whitenoise
+
 dj-database-url
+firebase-admin

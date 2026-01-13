@@ -4,8 +4,9 @@ from .views import (
     DonorStatsView, DonationHistoryView, BloodInventoryView, HospitalRequestsView, HospitalSearchView,
     ActiveRequestsView, HospitalListView, HospitalAppointmentsView,
     AdminStatsView, UserManagementView, AdminAlertsView, GlobalInventoryView, AdminDonorSearchView,
+
     AlertResponseView, NotificationView, ProfileUpdateView, AdminDonationHistoryView,
-    AdminAnalyticsView
+    AdminAnalyticsView, SaveFCMTokenView
 )
 
 urlpatterns = [
@@ -38,5 +39,7 @@ urlpatterns = [
     path('notifications/', NotificationView.as_view(), name='notifications'),
     path('admin/history/', AdminDonationHistoryView.as_view(), name='admin-history'),
     path('admin/analytics/', AdminAnalyticsView.as_view(), name='admin-analytics'),
+
     path('profile/update/', ProfileUpdateView.as_view(), name='profile-update'),
+    path('fcm/token/', SaveFCMTokenView.as_view(), name='save-fcm-token'),
 ]

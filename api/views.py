@@ -212,6 +212,31 @@ class BloodInventoryView(APIView):
         return Response({"success": True})
 
 class HospitalRequestsView(APIView):
+
+from firebase_admin import messaging
+from .firebase_config import initialize_firebase # Init on load
+
+class SaveFCMTokenView(APIView):
+    def post(self, request):
+        db = get_db()
+        user_id = request.data.get('userId')
+        token = request.data.get('token')
+        
+        if not user_id or not token:
+            return Response({"error": "userId and token required"}, status=400)
+            
+        # Update user with FCM token (add to list or replace single)
+        # We'll replace for simplicity per device, or use $addToSet for multi-device
+        db.users.update_one(
+            {"_id": ObjectId(user_id)},
+            {"$set": {"fcmToken": token}}
+        )
+        return Response({"success": True})
+
+# ... (Existing classes) ...
+
+class HospitalRequestsView(APIView):
+    # ... (GET method unchanged) ...
     def get(self, request):
         db = get_db()
         user_id = request.query_params.get('userId')
@@ -272,7 +297,7 @@ class HospitalRequestsView(APIView):
             requests.append(serialize_doc(req))
             
         return Response(requests)
-        
+
     def post(self, request):
         db = get_db()
         data = request.data
@@ -307,24 +332,31 @@ class HospitalRequestsView(APIView):
         res = db.requests.insert_one(data)
         
         # If this is an Emergency Alert, create Notifications for Donors immediately
-        # DISABLED: Admin manually sends notifications via Dashboard to prevent duplicates
-        # if data.get('type') == 'EMERGENCY_ALERT':
-        #      # Find compatible donors (same blood group)
-        #      donors = db.users.find({"role": "donor", "bloodGroup": data.get('bloodGroup')})
-        #      notifs = []
-        #      for d in donors:
-        #          notifs.append({
-        #              "recipientId": str(d['_id']),
-        #              "message": f"Urgent: {data.get('units')} units of {data.get('bloodGroup')} needed at {data.get('requesterName', 'Hospital')}!",
-        #              "type": "EMERGENCY_ALERT",
-        #              "relatedRequestId": str(res.inserted_id),
-        #              "status": "UNREAD",
-        #              "timestamp": datetime.datetime.now().isoformat(),
-        #              "expiresAt": data.get('expiresAt') # Propagate expiration to notification
-        #          })
-        #      
-        #      if notifs:
-        #          db.notifications.insert_many(notifs)
+        if data.get('type') == 'EMERGENCY_ALERT':
+             # Find compatible donors (same blood group)
+             donors = db.users.find({
+                 "role": "donor", 
+                 "bloodGroup": data.get('bloodGroup'),
+                 "fcmToken": {"$exists": True} # Only send to those with app/token
+             })
+             
+             for d in donors:
+                 token = d.get('fcmToken')
+                 if token:
+                     try:
+                        # Construct Messaging
+                        message = messaging.Message(
+                            notification=messaging.Notification(
+                                title="Emergency Blood Request!",
+                                body=f"{data.get('units')} units of {data.get('bloodGroup')} needed at {data.get('hospitalName', 'Hospital')}!"
+                            ),
+                            token=token,
+                        )
+                        # Send
+                        response = messaging.send(message)
+                        print('Successfully sent message:', response)
+                     except Exception as e:
+                         print(f"Error sending FCM: {e}")
 
         return Response({"success": True, "id": str(res.inserted_id)})
 
