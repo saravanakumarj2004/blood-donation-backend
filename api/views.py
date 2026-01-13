@@ -5,6 +5,8 @@ from .db import get_db
 from bson import ObjectId
 import datetime
 import math
+from firebase_admin import messaging
+from .firebase_config import initialize_firebase # Init on load
 
 # Haversine Formula for Distance (km)
 def calculate_distance(lat1, lon1, lat2, lon2):
@@ -211,11 +213,6 @@ class BloodInventoryView(APIView):
         )
         return Response({"success": True})
 
-class HospitalRequestsView(APIView):
-
-from firebase_admin import messaging
-from .firebase_config import initialize_firebase # Init on load
-
 class SaveFCMTokenView(APIView):
     def post(self, request):
         db = get_db()
@@ -225,15 +222,12 @@ class SaveFCMTokenView(APIView):
         if not user_id or not token:
             return Response({"error": "userId and token required"}, status=400)
             
-        # Update user with FCM token (add to list or replace single)
-        # We'll replace for simplicity per device, or use $addToSet for multi-device
+        # Update user with FCM token
         db.users.update_one(
             {"_id": ObjectId(user_id)},
             {"$set": {"fcmToken": token}}
         )
         return Response({"success": True})
-
-# ... (Existing classes) ...
 
 class HospitalRequestsView(APIView):
     # ... (GET method unchanged) ...
