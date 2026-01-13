@@ -327,11 +327,17 @@ class HospitalRequestsView(APIView):
         
         # If this is an Emergency Alert, create Notifications for Donors immediately
         if data.get('type') == 'EMERGENCY_ALERT':
-             # Find compatible donors (same blood group)
+             # Find compatible donors (same blood group) AND eligible (60 days rule)
+             limit_date = datetime.datetime.now() - datetime.timedelta(days=60)
              donors = db.users.find({
                  "role": "donor", 
                  "bloodGroup": data.get('bloodGroup'),
-                 "fcmToken": {"$exists": True} # Only send to those with app/token
+                 "fcmToken": {"$exists": True},
+                 "$or": [
+                    {"lastDonationDate": {"$exists": False}}, 
+                    {"lastDonationDate": None},
+                    {"lastDonationDate": {"$lt": limit_date.isoformat()}} 
+                 ]
              })
              
              for d in donors:
