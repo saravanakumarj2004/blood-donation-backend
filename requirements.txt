@@ -1,0 +1,9 @@
+Django>=5.0
+djangorestframework
+django-cors-headers
+
+pymongo
+python-dotenv
+gunicorn
+whitenoise
+dj-database-url
