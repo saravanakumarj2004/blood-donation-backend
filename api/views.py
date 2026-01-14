@@ -519,8 +519,8 @@ class HospitalSearchView(APIView):
 class ActiveRequestsView(APIView):
     def get(self, request):
         db = get_db()
-        # Find all requests that are Pending (Urgent)
-        cursor = db.requests.find({"status": "Pending"}).sort("date", -1)
+        # Find all requests that are Pending (Urgent from Manual) or Active (Emergency from Hospital)
+        cursor = db.requests.find({"status": {"$in": ["Pending", "Active"]}}).sort("date", -1)
         requests = []
         for req in cursor:
             # Get Hospital Name
