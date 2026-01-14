@@ -43,6 +43,18 @@ class RegisterView(APIView):
         if existing:
              return Response({"message": "Email already exists"}, status=status.HTTP_400_BAD_REQUEST)
         
+        # Enforce Age > 18
+        dob_str = data.get('dob')
+        if dob_str:
+            try:
+                dob = datetime.datetime.fromisoformat(dob_str)
+                today = datetime.datetime.now()
+                age = today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
+                if age < 18:
+                    return Response({"message": "You must be 18+ to register"}, status=status.HTTP_400_BAD_REQUEST)
+            except:
+                pass # Skip if invalid format, catch other validation later
+        
         # Prepare User Data
         new_user = {
             "name": data.get('name'),
@@ -1003,3 +1015,50 @@ class AdminAnalyticsView(APIView):
             "trends": trend_data,
             "activities": activities
         })
+
+class ForgotPasswordView(APIView):
+    def post(self, request):
+        """Step 1: Get Security Question by Email"""
+        db = get_db()
+        email = request.data.get('email')
+        if not email:
+            return Response({"error": "Email is required"}, status=400)
+            
+        user = db.users.find_one({"email": email})
+        if not user:
+            return Response({"error": "User not found"}, status=404)
+            
+        return Response({
+            "success": True,
+            "userId": str(user['_id']),
+            "securityQuestion": user.get('securityQuestion', "No question set")
+        })
+
+    def put(self, request):
+        """Step 2: Verify Answer and Reset Password"""
+        db = get_db()
+        user_id = request.data.get('userId')
+        answer = request.data.get('securityAnswer')
+        new_password = request.data.get('newPassword')
+        
+        if not user_id or not answer or not new_password:
+             return Response({"error": "Missing fields"}, status=400)
+             
+        user = db.users.find_one({"_id": ObjectId(user_id)})
+        if not user:
+             return Response({"error": "User not found"}, status=404)
+             
+        # Verify Answer (Case insensitive)
+        stored_answer = user.get('securityAnswer', '').lower().strip()
+        provided_answer = answer.lower().strip()
+        
+        if stored_answer != provided_answer:
+            return Response({"error": "Incorrect Answer"}, status=400)
+            
+        # Update Password
+        db.users.update_one(
+            {"_id": ObjectId(user_id)},
+            {"$set": {"password": new_password}}
+        )
+        
+        return Response({"success": True})

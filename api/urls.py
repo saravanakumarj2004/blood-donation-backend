@@ -6,7 +6,7 @@ from .views import (
     AdminStatsView, UserManagementView, AdminAlertsView, GlobalInventoryView, AdminDonorSearchView,
 
     AlertResponseView, NotificationView, ProfileUpdateView, AdminDonationHistoryView,
-    AdminAnalyticsView, SaveFCMTokenView
+    AdminAnalyticsView, SaveFCMTokenView, ForgotPasswordView
 )
 
 urlpatterns = [
@@ -41,5 +41,6 @@ urlpatterns = [
     path('admin/analytics/', AdminAnalyticsView.as_view(), name='admin-analytics'),
 
     path('profile/update/', ProfileUpdateView.as_view(), name='profile-update'),
+    path('auth/forgot-password/', ForgotPasswordView.as_view(), name='forgot-password'),
     path('fcm/token/', SaveFCMTokenView.as_view(), name='save-fcm-token'),
 ]
