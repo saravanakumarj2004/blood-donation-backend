@@ -1,11 +1,9 @@
 Django>=5.0
 djangorestframework
 django-cors-headers
-
+firebase-admin
 pymongo
 python-dotenv
 gunicorn
 whitenoise
-
 dj-database-url
-firebase-admin

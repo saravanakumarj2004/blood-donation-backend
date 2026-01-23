@@ -1,5 +1,6 @@
 import os
 import django
+import datetime
 from django.conf import settings
 
 # Setup Django Environment
@@ -15,24 +16,24 @@ def seed_users():
     # Define Default Users
     default_users = [
         {
-            "name": "Super Admin",
-            "email": "admin@blood.com",
-            "password": "admin123", # Plaintext for now as per current setup
-            "role": "admin",
-            "phone": "0000000000",
-            "location": "Headquarters"
+            "name": "Donor One",
+            "email": "donor@blood.com",
+            "password": "password123",
+            "role": "donor",
+            "bloodGroup": "O+",
+            "location": "New York",
+            "coordinates": {"lat": 40.7128, "lng": -74.0060},
+            "lastDonationDate": (datetime.datetime.now() - datetime.timedelta(days=100)).isoformat(),
+            "createdAt": datetime.datetime.now().isoformat()
         },
         {
-            "name": "City General Hospital",
-            "email": "hospital@city.com",
-            "password": "hospital123",
+            "name": "City Hospital",
+            "email": "hospital@blood.com",
+            "password": "password123",
             "role": "hospital",
-            "phone": "1234567890",
-            "location": "Downtown",
-            "coordinates": {
-                "latitude": 12.9716, 
-                "longitude": 77.5946 
-            }
+            "location": "New York",
+            "coordinates": {"lat": 40.7306, "lng": -73.9352},
+            "createdAt": datetime.datetime.now().isoformat()
         }
     ]
     

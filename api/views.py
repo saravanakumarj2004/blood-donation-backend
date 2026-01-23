@@ -5,10 +5,39 @@ from .db import get_db
 from bson import ObjectId
 import datetime
 import math
-from firebase_admin import messaging
-from .firebase_config import initialize_firebase # Init on load
-import traceback
-import re
+import jwt
+import os
+from django.conf import settings
+
+# Firebase Imports
+import firebase_admin
+from firebase_admin import credentials, messaging
+
+# Initialize Firebase App (Lazy Singleton)
+try:
+    if not firebase_admin._apps:
+        cred_path = os.getenv('FIREBASE_CREDENTIALS', 'serviceAccountKey.json')
+        if os.path.exists(cred_path):
+             cred = credentials.Certificate(cred_path)
+             firebase_admin.initialize_app(cred)
+        else:
+             print("Warning: Firebase Credentials not found. Push Notifications will not send.")
+except Exception as e:
+    print(f"Firebase Init Error: {e}")
+
+# Push Notification Helper
+def send_push_multicast(tokens, title, body, data=None):
+    if not tokens or not firebase_admin._apps:
+        return
+    try:
+        message = messaging.MulticastMessage(
+            notification=messaging.Notification(title=title, body=body),
+            data=data or {},
+            tokens=tokens,
+        )
+        messaging.send_multicast(message)
+    except Exception as e:
+        print(f"Push Error: {e}")
 
 # Haversine Formula for Distance (km)
 def calculate_distance(lat1, lon1, lat2, lon2):
@@ -21,89 +50,173 @@ def calculate_distance(lat1, lon1, lat2, lon2):
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return R * c
 
-# Helper to serialize Mongo document
 def serialize_doc(doc):
     if not doc:
         return None
     doc['id'] = str(doc['_id'])
     del doc['_id']
+    if 'password' in doc:
+        del doc['password']
     return doc
+
+def consume_batches_fifo(db, hospital_id, blood_group, units_needed):
+    """
+    Deduct units from batches using FIFO (First-In, First-Out) strategy.
+    Returns actual units consumed.
+    """
+    consumed = 0
+    try:
+        # Fetch batches sorted by date (Oldest first)
+        batches = db.batches.find({
+            "hospitalId": hospital_id, 
+            "bloodGroup": blood_group,
+            "units": {"$gt": 0}
+        }).sort("collectedDate", 1)
+        
+        for batch in batches:
+            if consumed >= units_needed:
+                break
+                
+            available = batch.get('units', 0)
+            to_take = min(available, units_needed - consumed)
+            
+            # Atomic update for safety
+            db.batches.update_one(
+                {"_id": batch['_id']},
+                {"$inc": {"units": -to_take}}
+            )
+            
+            consumed += to_take
+            
+    except Exception as e:
+        print(f"Batch Consumption Error: {e}")
+        
+    return consumed
 
 class RegisterView(APIView):
     def post(self, request):
         db = get_db()
         data = request.data
         
-        email = data.get('email')
+        email = data.get('email', '').strip().lower()
+        data['email'] = email # Ensure stored lowercase
         role = data.get('role')
         
-        if not email or not role:
-             return Response({"message": "Email and Role are required"}, status=status.HTTP_400_BAD_REQUEST)
-
+        # Validate Role (Security Hardening)
+        if role.lower() == 'admin':
+             return Response({"message": "Admin registration is restricted."}, status=status.HTTP_403_FORBIDDEN)
+        
         # Check existing
         existing = db.users.find_one({"email": email})
         if existing:
              return Response({"message": "Email already exists"}, status=status.HTTP_400_BAD_REQUEST)
         
-        # Enforce Age > 18
-        dob_str = data.get('dob')
-        if dob_str:
-            try:
-                dob = datetime.datetime.fromisoformat(dob_str)
-                today = datetime.datetime.now()
-                age = today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
-                if age < 18:
-                    return Response({"message": "You must be 18+ to register"}, status=status.HTTP_400_BAD_REQUEST)
-            except:
-                pass # Skip if invalid format, catch other validation later
+        # Validate Age (18+)
+        # Validation
+        required = ['name', 'email', 'password', 'role']
+        for field in required:
+            if not data.get(field):
+                return Response({"error": f"{field} is required"}, status=status.HTTP_400_BAD_REQUEST)
         
-        # Prepare User Data
-        new_user = {
-            "name": data.get('name'),
-            "email": email,
-            "password": data.get('password'), 
-            "role": role,
-            "phone": data.get('phone'),
-            "location": data.get('location'),
-            "coordinates": data.get('coordinates'), # Store Lat/Lng
-            "bloodGroup": data.get('bloodGroup'), # For Donors
-            "dob": data.get('dob'),
-            "lastDonationDate": data.get('lastDonationDate'), # Initial value from registration
-            "gender": data.get('gender'),
-            "securityQuestion": data.get('securityQuestion'),
-            "securityAnswer": data.get('securityAnswer'),
-            "createdAt": datetime.datetime.now().isoformat()
-        }
+        # Prevent Admin Registration
+        if data.get('role') == 'admin':
+            return Response({"error": "Admin registration is restricted"}, status=status.HTTP_403_FORBIDDEN)
+            
+        # Age Validation (18+)
+        if data.get('dob'):
+             try:
+                 dob = datetime.datetime.fromisoformat(data['dob'].replace('Z', ''))
+                 age = (datetime.datetime.now() - dob).days // 365
+                 if age < 18:
+                     return Response({"error": "Must be 18+ to register"}, status=status.HTTP_400_BAD_REQUEST)
+             except:
+                 pass
+
+        if db.users.find_one({"email": data['email']}):
+            return Response({"error": "Email already exists"}, status=status.HTTP_409_CONFLICT)
+            
+        # Hash Password (Simple Logic for Demo - Production use Django Auth)
+        from django.contrib.auth.hashers import make_password
+        data['password'] = make_password(data['password'])
         
-        # Save to DB
-        result = db.users.insert_one(new_user)
+        data['createdAt'] = datetime.datetime.now().isoformat()
         
-        # Return success with ID
-        new_user['id'] = str(result.inserted_id)
-        del new_user['_id']
-        del new_user['password'] 
+        # New: Initialize empty profile fields for Donor
+        if data['role'] == 'donor':
+            data.setdefault('isAvailable', True)
+            data.setdefault('bloodGroup', None)
+            data.setdefault('location', "")
+            data.setdefault('fcmToken', "") # Store FCM Token
+            
+        result = db.users.insert_one(data)
         
-        return Response({"success": True, "user": new_user}, status=status.HTTP_201_CREATED)
+        return Response({
+            "success": True, 
+            "message": "User registered successfully",
+            "userId": str(result.inserted_id)
+        }, status=status.HTTP_201_CREATED)
+
+from rest_framework.permissions import AllowAny
 
 class LoginView(APIView):
+    permission_classes = [AllowAny]
     def post(self, request):
-        db = get_db()
-        email = request.data.get('email')
-        password = request.data.get('password')
-        role = request.data.get('role')
-        
-        if not email or not password or not role:
-            return Response({"message": "All fields required"}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            db = get_db()
+            if db is None:
+                print("CRITICAL: Database connection failed (db is None)")
+                return Response({"error": "Database Service Unavailable"}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+            email = request.data.get('email')
+            password = request.data.get('password')
+            fcm_token = request.data.get('fcmToken') # Capture Token on Login
             
-        user = db.users.find_one({"email": email, "role": role})
-        
-        if not user:
-            return Response({"message": "Invalid credentials or role"}, status=status.HTTP_401_UNAUTHORIZED)
+            user = db.users.find_one({"email": email})
             
-        if user.get('password') != password:
-            return Response({"message": "Invalid password"}, status=status.HTTP_401_UNAUTHORIZED)
+            if not user:
+                return Response({"error": "Invalid credentials"}, status=status.HTTP_401_UNAUTHORIZED)
+                
+            from django.contrib.auth.hashers import check_password
+            # Support both hashed and legacy headers
+            try:
+                is_valid = check_password(password, user['password'])
+            except:
+                is_valid = (password == user['password'])
+                
+            if not is_valid:
+                if password != user['password']: # Fallback
+                    return Response({"error": "Invalid credentials"}, status=status.HTTP_401_UNAUTHORIZED)
+
+            # Update FCM Token & Last Login
+            update_data = {"lastLogin": datetime.datetime.now().isoformat()}
+            if fcm_token:
+                update_data["fcmToken"] = fcm_token
+                
+            db.users.update_one({"_id": user['_id']}, {"$set": update_data})
+
+            # JWT Token Generation
+            payload = {
+                "id": str(user['_id']),
+                "role": user['role'],
+                "exp": datetime.datetime.utcnow() + datetime.timedelta(days=1),
+                "iat": datetime.datetime.utcnow()
+            }
+            token = jwt.encode(payload, settings.SECRET_KEY, algorithm='HS256')
             
-        return Response({"success": True, "user": serialize_doc(user)})
+            # Ensure token is string (PyJWT 2.0+ returns string, 1.7 returns bytes)
+            if isinstance(token, bytes):
+                token = token.decode('utf-8')
+            
+            response_data = serialize_doc(user)
+            response_data['token'] = token
+            response_data['success'] = True # Explicitly add success flag for Frontend compatibility
+            
+            return Response(response_data)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"LOGIN ERROR: {str(e)}")
+            return Response({"error": f"Internal Server Error: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 class DonorStatsView(APIView):
     def get(self, request):
@@ -183,6 +296,60 @@ class DonationHistoryView(APIView):
     def post(self, request):
         db = get_db()
         data = request.data
+        
+        # 1. Eligibility Check (Backend Logic Migration)
+        donor_id = data.get('donorId')
+        if donor_id:
+            try:
+                user = db.users.find_one({"_id": ObjectId(donor_id)})
+                if user and user.get('lastDonationDate'):
+                    last_date_str = user.get('lastDonationDate')
+                    if last_date_str.endswith('Z'):
+                        last_date_str = last_date_str[:-1]
+                        
+                    last_date = datetime.datetime.fromisoformat(last_date_str)
+                    
+                    # FORCE NAIVE
+                    if last_date.tzinfo is not None:
+                        last_date = last_date.replace(tzinfo=None)
+                        
+                    # Check against TARGET DATE (Booking Date) or Now if not set
+                    booking_date_str = data.get('date')
+                    target_date = datetime.datetime.now()
+                    if booking_date_str:
+                         try:
+                             if booking_date_str.endswith('Z'): booking_date_str = booking_date_str[:-1]
+                             target_date = datetime.datetime.fromisoformat(booking_date_str)
+                             if target_date.tzinfo is not None: target_date = target_date.replace(tzinfo=None)
+                         except:
+                             pass
+                    
+                    days_diff = (target_date - last_date).days
+                    
+                    if days_diff < 60:
+                        eligible_date = last_date + datetime.timedelta(days=60)
+                        date_str = eligible_date.strftime("%d %b %Y")
+                        return Response(
+                            {"error": f"You are not eligible for this date. Earliest available: {date_str}."}, 
+                            status=status.HTTP_400_BAD_REQUEST
+                        )
+            except Exception as e:
+                print(f"Eligibility Check Error: {e}")
+                pass
+                
+            # 2. Check for Existing Active Appointments (Double-Booking Prevention)
+            existing_appt = db.appointments.find_one({
+                "donorId": donor_id,
+                "status": {"$in": ["Pending", "Scheduled"]}
+            })
+            
+            if existing_appt:
+                existing_date = existing_appt.get('date', '').split('T')[0]
+                return Response(
+                    {"error": f"You already have an active appointment scheduled for {existing_date}. Please complete or cancel it first."},
+                    status=status.HTTP_409_CONFLICT
+                )
+
         if 'date' not in data:
             data['date'] = datetime.datetime.now().isoformat()
         if 'status' not in data:
@@ -194,60 +361,44 @@ class DonationHistoryView(APIView):
         elif 'type' not in data:
             data['type'] = 'Voluntary Donation'
 
-        # Validate Donor
-        donor_id = data.get('donorId')
-        if not donor_id:
-            return Response({"error": "donorId required"}, status=400)
-            
-        # Validate Hospital (if selected)
-        if data.get('hospitalId'):
-            hospital = db.users.find_one({"_id": ObjectId(data.get('hospitalId')), "role": "hospital"})
-            if not hospital:
-                 return Response({"error": "Invalid hospital selected"}, status=400)
-
-        # 60-Day Eligibility Check
-        try:
-            # Check last completed donation or appointment
-            last_appt = db.appointments.find_one(
-                {"donorId": donor_id, "status": "Completed"},
-                sort=[("date", -1)]
-            )
-            donor_user = db.users.find_one({"_id": ObjectId(donor_id)})
-            
-            last_date = None
-            if last_appt:
-                last_date = datetime.datetime.fromisoformat(last_appt['date'].replace('Z', '+00:00'))
-            
-            if donor_user and donor_user.get('lastDonationDate'):
-                try:
-                    last_donation_str = donor_user['lastDonationDate']
-                    if 'T' in last_donation_str:
-                         u_date = datetime.datetime.fromisoformat(last_donation_str.replace('Z', '+00:00'))
-                    else:
-                         u_date = datetime.datetime.strptime(last_donation_str, "%Y-%m-%d")
-                         u_date = u_date.replace(tzinfo=datetime.timezone.utc)
-                         
-                    if last_date is None or u_date > last_date:
-                        last_date = u_date
-                except Exception as e:
-                    print(f"Error parsing user lastDonationDate: {e}")
-            
-            if last_date:
-                if last_date.tzinfo is None:
-                    last_date = last_date.replace(tzinfo=datetime.timezone.utc)
-                
-                # Check 60 days
-                now_utc = datetime.datetime.now(datetime.timezone.utc)
-                if (now_utc - last_date).days < 60:
-                     return Response({"error": "You are not eligible to donate yet (60-day cooling period)."}, status=400)
-        except Exception as e:
-            print(f"Eligibility check error: {e}")
-            # Fail safe or allow? Allow for now but log.
-            pass
-
         # Insert into appointments (Single Source of Truth)
         res = db.appointments.insert_one(data)
         return Response({"success": True, "id": str(res.inserted_id)})
+
+    def put(self, request):
+        db = get_db()
+        data = request.data
+        appt_id = data.get('id')
+        new_status = data.get('status')
+        # rejectionReason optional
+        
+        if not appt_id or not new_status:
+            return Response({"error": "Missing id or status"}, status=400)
+
+        appt = db.appointments.find_one({"_id": ObjectId(appt_id)})
+        if not appt:
+            return Response({"error": "Appointment not found"}, status=404)
+
+        # INTEGRITY CHECK: Terminal State Locking
+        current_status = appt.get('status')
+        if current_status in ['Completed', 'Cancelled'] and new_status != current_status:
+             return Response({"error": f"Cannot modify a {current_status} appointment."}, status=status.HTTP_400_BAD_REQUEST)
+             
+        # SECURITY: Donors can ONLY Cancel. They cannot mark Completed.
+        if new_status == 'Completed':
+             return Response({"error": "Only hospitals can mark appointments as Completed."}, status=status.HTTP_403_FORBIDDEN)
+
+        if new_status == 'Cancelled':
+             # Allow Cancellation
+             db.appointments.update_one(
+                 {"_id": ObjectId(appt_id)},
+                 {"$set": {"status": "Cancelled", "cancelReason": data.get('reason', 'Donor Cancelled')}}
+             )
+             return Response({"success": True})
+             
+        return Response({"error": "Invalid Status Update"}, status=400)
+
+
 
 class BloodInventoryView(APIView):
     def get(self, request):
@@ -256,93 +407,158 @@ class BloodInventoryView(APIView):
         if not user_id:
              return Response({"error": "userId required"}, status=400)
              
-        inventory = db.inventory.find_one({"hospitalId": user_id})
-        if not inventory:
-            default_stock = {
-                "A+": 0, "A-": 0, "B+": 0, "B-": 0, 
-                "AB+": 0, "AB-": 0, "O+": 0, "O-": 0
-            }
-            return Response(default_stock)
+        inventory = db.inventory.find_one({"hospitalId": user_id}) or {}
+        
+        # Lazy Sync: Check for expired batches and update inventory
+        try:
+            now_iso = datetime.datetime.now().isoformat()
             
-        return Response(serialize_doc(inventory))
+            # Find active batches that have expired
+            expired_batches = list(db.batches.find({
+                "hospitalId": user_id, 
+                "units": {"$gt": 0},
+                "expiryDate": {"$lt": now_iso}
+            }))
+            
+            if expired_batches:
+                for batch in expired_batches:
+                    qty = batch.get('units', 0)
+                    bg = batch.get('bloodGroup')
+                    
+                    if qty > 0 and bg:
+                        # Decrement Inventory
+                        db.inventory.update_one(
+                            {"hospitalId": user_id},
+                            {"$inc": {bg: -qty}}
+                        )
+                        # Mark Batch as Expired (Units 0)
+                        db.batches.update_one(
+                            {"_id": batch['_id']},
+                            {"$set": {"units": 0, "status": "Expired"}}
+                        )
+                        print(f"Expired Batch {batch['_id']}: Removed {qty} units of {bg}")
+                
+                # Re-fetch inventory after updates
+                inventory = db.inventory.find_one({"hospitalId": user_id}) or {}
+        except Exception as e:
+            print(f"Batch Expiry Sync Error: {e}")
+
+        # Logic: Determine Status on Backend
+        items = []
+        for bg in ['A+', 'A-', 'B+', 'B-', 'O+', 'O-', 'AB+', 'AB-']:
+            count = inventory.get(bg, 0)
+            status_label = "Good"
+            if count < 5:
+                status_label = "Critical"
+            elif count < 10:
+                status_label = "Low"
+                
+            items.append({
+                "type": bg,
+                "total": max(0, count), # Ensure no negative
+                "status": status_label
+            })
+            
+        return Response(items)
 
     def post(self, request):
         db = get_db()
         data = request.data
         user_id = data.get('hospitalId')
         
-        # Check if this is a "Stock Entry" (incremental) or a Manual Update (set)
-        # Assuming H3 Stock Entry feature uses this.
-        
-        if data.get('mode') == 'incremental':
-            # Handle incremental updates (Stock Entry Log)
-             group = data.get('bloodGroup')
-             units = int(data.get('units', 0))
-             if group and units:
-                 db.inventory.update_one(
-                    {"hospitalId": user_id},
-                    {"$inc": {group: units}},
-                    upsert=True
-                 )
-                 # Log the entry
-                 log_entry = {
-                     "hospitalId": user_id,
-                     "bloodGroup": group,
-                     "units": units,
-                     "type": "Stock Entry",
-                     "date": datetime.datetime.now().isoformat(),
-                     "source": data.get('source', 'Manual Entry'),
-                     "expiry": data.get('expiry')
-                 }
-                 db.stock_logs.insert_one(log_entry)
-        else:
-            # Full update
-            db.inventory.update_one(
-                {"hospitalId": user_id},
-                {"$set": data},
-                upsert=True
-            )
-        
-        return Response({"success": True})
-
-class SaveFCMTokenView(APIView):
-    def post(self, request):
-        db = get_db()
-        user_id = request.data.get('userId')
-        token = request.data.get('token')
-        
-        if not user_id or not token:
-            return Response({"error": "userId and token required"}, status=400)
-            
-        # Update user with FCM token
-        db.users.update_one(
-            {"_id": ObjectId(user_id)},
-            {"$set": {"fcmToken": token}}
+        db.inventory.update_one(
+            {"hospitalId": user_id},
+            {"$set": data},
+            upsert=True
         )
         return Response({"success": True})
 
 class HospitalRequestsView(APIView):
     def get(self, request):
         db = get_db()
+    def get(self, request):
+        db = get_db()
         user_id = request.query_params.get('userId')
+        filter_type = request.query_params.get('filter', 'all') # all, sent, received
+        search_term = request.query_params.get('search', '')
         
-        # 1. OUTGOING (Requests I sent)
-        outgoing_query = {"requesterId": user_id}
-        my_requests_cursor = db.requests.find(outgoing_query).sort("date", -1)
+        # Base Lists
+        my_requests = []
+        incoming_requests = []
+
+        # 1. Fetch Outgoing (If needed)
+        if filter_type in ['all', 'sent']:
+            outgoing_query = {
+                "$or": [
+                    {"requesterId": user_id},
+                    {"hospitalId": user_id, "type": {"$ne": "P2P"}} 
+                ]
+            }
+            if search_term:
+                # Basic search on status or bloodGroup first, complicated for dynamic names without join.
+                # For simplicity/performance in Mongo without $lookup aggregation pipeline, we will fetch and filter in python if needed, 
+                # OR implement basic regex on fields we have.
+                outgoing_query["$or"] = outgoing_query["$or"] + [] # Append search queries if simple fields
+                pass 
+                
+            my_requests = list(db.requests.find(outgoing_query).sort("date", -1))
+
+        # 2. Fetch Incoming (If needed)
+        if filter_type in ['all', 'received']:
+             incoming_query = {
+                "$or": [
+                    {"hospitalId": user_id, "type": "P2P"}, 
+                    {"type": "EMERGENCY_ALERT", "requesterId": {"$ne": user_id}} 
+                ]
+            }
+            # Add basic filtering if possible
+             incoming_requests = list(db.requests.find(incoming_query).sort("date", -1))
         
-        # 2. INCOMING (Requests sent TO me)
-        # Only show requests specifically targeting this hospital
-        incoming_query = {
-            "hospitalId": user_id, 
-            "requesterId": {"$ne": user_id} 
-        }
+        # Combine
+        combined = []
         
-        incoming_cursor = db.requests.find(incoming_query).sort("date", -1)
-        incoming_list = list(incoming_cursor)
+        # Process Outgoing
+        for req in my_requests:
+            req['isOutgoing'] = True
+            if req.get('acceptedBy'):
+                donor = db.users.find_one({"_id": ObjectId(req['acceptedBy'])})
+                req['donorName'] = donor.get('name') if donor else "Unknown Donor"
+            combined.append(req)
+            
+        # Process Incoming
+        for req in incoming_requests:
+            req['isOutgoing'] = False
+            # Hide if accepted by others (Logic moved from earlier)
+            if req.get('acceptedBy') and req.get('acceptedBy') != user_id:
+                continue 
+            requester_id = req.get('requesterId') or req.get('hospitalId')
+            if requester_id:
+                requester = db.users.find_one({"_id": ObjectId(requester_id)})
+                req['hospitalName'] = requester.get('name') if requester else "Unknown Hospital"
+                req['location'] = requester.get('location') if requester else "Unknown"
+            combined.append(req)
+
+        # 3. Apply Search Filter (Python Side for joins consistency, unless we use aggregates)
+        # Moving logic to backend means backend does this.
+        final_results = []
+        if search_term:
+            term = search_term.lower()
+            for req in combined:
+                # Search across computed fields
+                party_name = (req.get('hospitalName') or req.get('requesterName') or '').lower()
+                bg = (req.get('bloodGroup') or '').lower()
+                stat = (req.get('status') or '').lower()
+                
+                if term in party_name or term in bg or term in stat:
+                    final_results.append(serialize_doc(req))
+        else:
+            final_results = [serialize_doc(req) for req in combined]
+            
+        return Response(final_results)
 
         requests = []
         
-        # Process My Requests
+        # Process My Requests (Outgoing)
         for req in my_requests_cursor:
             req['isOutgoing'] = True
             if req.get('acceptedBy'):
@@ -351,7 +567,7 @@ class HospitalRequestsView(APIView):
             
             requests.append(serialize_doc(req))
             
-        # Process Incoming Requests
+        # Process Incoming Requests (Incoming)
         for req in incoming_list:
             req['isOutgoing'] = False
             
@@ -359,7 +575,8 @@ class HospitalRequestsView(APIView):
             if req.get('acceptedBy') and req.get('acceptedBy') != user_id:
                 continue 
 
-            # Fetch Requester Name
+            # Fetch Requester Name (Who is asking?)
+            # If P2P, requesterId is the source. If Emergency, requesterId/hospitalId is source.
             requester_id = req.get('requesterId') or req.get('hospitalId')
             if requester_id:
                 requester = db.users.find_one({"_id": ObjectId(requester_id)})
@@ -369,18 +586,18 @@ class HospitalRequestsView(APIView):
             requests.append(serialize_doc(req))
             
         return Response(requests)
-
+        
     def post(self, request):
         db = get_db()
         data = request.data
         data['date'] = datetime.datetime.now().isoformat()
         data['status'] = 'Active'
         
-        # Calculate Expiration Time
+        # Calculate Expiration Time based on requiredTime
         req_time = data.get('requiredTime')
         if req_time:
             now = datetime.datetime.now()
-            delta = datetime.timedelta(hours=24) 
+            delta = datetime.timedelta(hours=24) # Default fallback
             
             if '30 mins' in req_time:
                 delta = datetime.timedelta(minutes=30)
@@ -391,117 +608,222 @@ class HospitalRequestsView(APIView):
             elif '4 Hours' in req_time:
                 delta = datetime.timedelta(hours=4)
             elif 'Today' in req_time:
+                # End of day
                 params = now.replace(hour=23, minute=59, second=59)
                 delta = params - now
             
             data['expiresAt'] = (now + delta).isoformat()
+        else:
+             # Default to 24 hours if not specified
+             data['expiresAt'] = (datetime.datetime.now() + datetime.timedelta(hours=24)).isoformat()
         
+        # Ensure units is integer
         if 'units' in data:
-            data['units'] = int(data['units'])
+            try:
+                data['units'] = int(data['units'])
+                if data['units'] <= 0:
+                    return Response({"error": "Units must be greater than 0"}, status=status.HTTP_400_BAD_REQUEST)
+            except ValueError:
+                 return Response({"error": "Units must be a number"}, status=status.HTTP_400_BAD_REQUEST)
+        else:
+             return Response({"error": "Units required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        if 'bloodGroup' not in data:
+             return Response({"error": "Blood Group required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        # START: Backend Logic for P2P Integrity
+        if data.get('type') == 'P2P':
+            target_id = data.get('hospitalId') # In P2P, this is the Target Donor
+            requester_id = data.get('requesterId')
             
+            if not target_id:
+                return Response({"error": "Target Donor (hospitalId) request for P2P"}, status=status.HTTP_400_BAD_REQUEST)
+            
+            if target_id == requester_id:
+                 return Response({"error": "Cannot request blood from yourself"}, status=status.HTTP_400_BAD_REQUEST)
+                 
+            # Verify Target is a Hospital
+            target_hospital = db.users.find_one({"_id": ObjectId(target_id), "role": "hospital"})
+            if not target_hospital:
+                 return Response({"error": "Target recipient is not a valid hospital"}, status=status.HTTP_400_BAD_REQUEST)
+                 
+        # END: Backend Logic
+
+        if data.get('type') == 'EMERGENCY_ALERT':
+             # Find all eligible donors with matching blood group
+             query = {
+                 "role": "donor",
+                 "bloodGroup": data.get('bloodGroup')
+             }
+             # Filter by Cities if provided
+             if data.get('cities'):
+                 query['location'] = {"$in": data.get('cities')}
+                 
+             donors = list(db.users.find(query))
+        
+        # 3. Create Request (ONCE)
         res = db.requests.insert_one(data)
         
-        # If this is an Emergency Alert, create Notifications for Donors immediately
-        if data.get('type') == 'EMERGENCY_ALERT' or data.get('type') == 'P2P':
-             limit_date = datetime.datetime.now() - datetime.timedelta(days=60)
-             
-             query_filter = {
-                 "role": "donor", 
-                 "bloodGroup": data.get('bloodGroup'),
-                 # "fcmToken": {"$exists": True}, # Optional: Find all for DB notifications?
-                 "$or": [
-                    {"lastDonationDate": {"$exists": False}}, 
-                    {"lastDonationDate": None},
-                    {"lastDonationDate": {"$lt": limit_date.isoformat()}} 
-                 ]
-             }
-             
-             # City Filter for P2P/Emergency
-             cities = data.get('cities')
-             if cities and isinstance(cities, list):
-                 # Create regex to match ANY of the target cities
-                 city_regexs = [re.compile(f"{c}", re.IGNORECASE) for c in cities]
-                 query_filter['location'] = {"$in": city_regexs}
-             elif data.get('location'): # Fallback for single location
-                  query_filter['location'] = {"$regex": data.get('location'), "$options": "i"}
-
-             donors = db.users.find(query_filter)
-             
-             req_id = str(res.inserted_id)
-             notif_title = "Emergency Blood Request!" if data.get('type') == 'EMERGENCY_ALERT' else "Urgent Blood Needed!"
-             
-             for d in donors:
-                 # 1. Send Push Notification
-                 token = d.get('fcmToken')
-                 if token:
-                     try:
-                        message = messaging.Message(
-                            notification=messaging.Notification(
-                                title=notif_title,
-                                body=f"{data.get('units')} units of {data.get('bloodGroup')} needed at {data.get('hospitalName', 'Hospital')}!"
-                            ),
-                            token=token,
-                        )
-                        messaging.send(message)
-                     except Exception as e:
-                         print(f"Error sending FCM: {e}")
+        if data.get('type') == 'P2P' and data.get('hospitalId'):
+            # Notify Target Hospital
+            db.notifications.insert_one({
+                "recipientId": data.get('hospitalId'),
+                "type": "P2P_REQUEST",
+                "title": "New Blood Request",
+                "message": f"{data.get('requesterName', 'A Hospital')} requested {data.get('units')} units of {data.get('bloodGroup')}.",
+                "relatedRequestId": str(res.inserted_id),
+                "timestamp": datetime.datetime.now().isoformat(),
+                "status": "UNREAD"
+            })
+            
+        elif data.get('type') == 'EMERGENCY_ALERT':
+             # Send Push to Donors
+             tokens = [d['fcmToken'] for d in donors if d.get('fcmToken')]
+             if tokens:
+                 send_push_multicast(
+                     tokens, 
+                     "Emergency Blood Needed!", 
+                     f"Urgent: {data.get('bloodGroup')} blood needed at {data.get('hospitalName', 'a nearby hospital')}.",
+                     {
+                         "type": "EMERGENCY_ALERT", 
+                         "requestId": str(res.inserted_id) # Payload needed for App
+                     }
+                 )
                  
-                 # 2. Create In-App Notification (Optional but good for history)
-                 db.notifications.insert_one({
-                    "userId": str(d['_id']),
-                    "message": f"{data.get('units')} units of {data.get('bloodGroup')} needed at {data.get('hospitalName')} in {data.get('city', 'your area')}.",
-                    "type": "URGENT_REQUEST",
-                    "requestId": req_id,
-                    "status": "UNREAD",
-                    "timestamp": datetime.datetime.now().isoformat()
+             # Create notifications in DB for history
+             notifs = []
+             for d in donors:
+                 notifs.append({
+                     "recipientId": str(d['_id']),
+                     "type": "EMERGENCY_ALERT",
+                     "title": "Emergency Blood Needed!",
+                     "message": f"Urgent: {data.get('bloodGroup')} blood needed.",
+                     "relatedRequestId": str(res.inserted_id),
+                     "timestamp": datetime.datetime.now().isoformat(),
+                     "status": "UNREAD"
                  })
+             if notifs:
+                 db.notifications.insert_many(notifs)
 
         return Response({"success": True, "id": str(res.inserted_id)})
+        
+
 
     def put(self, request):
         db = get_db()
         data = request.data
         req_id = data.get('id')
         new_status = data.get('status')
+        # ID of the hospital performing the action (Accept/Complete)
         responder_id = data.get('hospitalId') 
         
         if not req_id or not new_status:
             return Response({"error": "id and status are required"}, status=400)
             
+        # Fetch Request First
+        req = db.requests.find_one({"_id": ObjectId(req_id)})
+        if not req:
+             return Response({"error": "Request not found"}, status=404)
+             
+        # GUARD: Immutability check
+        if req.get('status') == 'Completed':
+             return Response({"error": "Cannot modify a completed request"}, status=status.HTTP_409_CONFLICT)
+
+        # Update Request
         dataset = {"status": new_status}
         
+        # Save optional response message
         if data.get('responseMessage'):
             dataset['responseMessage'] = data.get('responseMessage')
         
         if new_status == 'Accepted':
+            # 1. EXPIRY CHECK
+            if req.get('expiresAt'):
+                try:
+                    exp_date = datetime.datetime.fromisoformat(req['expiresAt'].replace('Z', ''))
+                    if exp_date < datetime.datetime.now():
+                         # Auto-expire it instead of just erroring?
+                         db.requests.update_one({"_id": ObjectId(req_id)}, {"$set": {"status": "Expired"}})
+                         return Response({"error": "This request has expired."}, status=400)
+                except:
+                    pass
+
             if not responder_id:
                 return Response({"error": "hospitalId required for acceptance"}, status=400)
-            dataset['acceptedBy'] = responder_id
             
-            # NOTIFICATION: Notify the Requester that their request was Accepted
-            req_info = db.requests.find_one({"_id": ObjectId(req_id)})
-            if req_info:
-                # Requester ID logic
-                reqr_id = req_info.get('requesterId') # Should be correct requester
-                if not reqr_id and req_info.get('hospitalId') and not req_info.get('isBroadcast'): 
-                     # Fallback if hospitalId was used as requester in older logic, 
-                     # but we aligned on requesterId. 
-                     reqr_id = req_info.get('hospitalId')
-
-                if reqr_id:
-                     # Fetch Responder Name
-                     responder = db.users.find_one({"_id": ObjectId(responder_id)})
-                     resp_name = responder.get('name', 'A Responder') if responder else 'A Responder'
-                     
-                     db.notifications.insert_one({
-                        "userId": reqr_id, # Notify the one who ASKED for blood
-                        "message": f"{resp_name} has accepted your request for {req_info.get('bloodGroup')} blood under {req_info.get('patientName', 'Patient')}.",
+            # CONCURRENCY CHECK: Prevent Double Acceptance
+            if req.get('acceptedBy') and req.get('acceptedBy') != responder_id:
+                 return Response({"error": "Request already accepted by another hospital"}, status=status.HTTP_409_CONFLICT)
+                 
+            dataset['acceptedBy'] = responder_id
+            dataset['acceptedAt'] = datetime.datetime.now().isoformat()
+            
+            # NOTIFY REQUESTER (Hospital)
+            requester_id = req.get('requesterId')
+            if requester_id:
+                requester = db.users.find_one({"_id": ObjectId(requester_id)})
+                if requester:
+                    responder = db.users.find_one({"_id": ObjectId(responder_id)})
+                    resp_name = responder.get('name') if responder else "A Hospital"
+                    
+                    title = "Request Accepted"
+                    body = f"{resp_name} has accepted your request for {req.get('units')} units."
+                    
+                    # DB Notification
+                    db.notifications.insert_one({
+                        "recipientId": str(requester['_id']),
+                        "title": title,
+                        "message": body,
                         "type": "REQUEST_ACCEPTED",
                         "relatedRequestId": req_id,
                         "status": "UNREAD",
                         "timestamp": datetime.datetime.now().isoformat()
-                     })
-            
+                    })
+                    
+                    # FCM Push
+                    if requester.get('fcmToken'):
+                        send_push_multicast([requester['fcmToken']], title, body, {"type": "REQUEST_ACCEPTED", "requestId": req_id})
+
+            # CRITICAL: If StockTransfer or P2P, Decrement Responder's Inventory immediately on Acceptance
+            # This prevents double-booking (promising same stock to multiple people)
+            if req.get('type') in ['P2P', 'StockTransfer']:
+                bg = req.get('bloodGroup')
+                units = int(req.get('units', 1))
+                
+                # Check Responder Stock
+                responder_inv = db.inventory.find_one({"hospitalId": responder_id})
+                current_stock = int(responder_inv.get(bg, 0)) if responder_inv else 0
+                
+                if current_stock < units:
+                     return Response({"error": f"Insufficient {bg} stock ({current_stock} available)."}, status=400)
+                
+                # Decrement Inventory (Aggregate)
+                db.inventory.update_one(
+                    {"hospitalId": responder_id},
+                    {"$inc": {bg: -units}}
+                )
+                
+                # CRITICAL: Also Consume Batches (Physical Stock) to match Inventory
+                # This prevents "Double Spending" of the same blood units
+                consume_batches_fifo(db, responder_id, bg, units)
+
+        if new_status == 'Cancelled' and current_status == 'Accepted':
+             # REFUND LOGIC: If it was a StockTransfer/P2P that was accepted, the responder lost stock. Refund it.
+             if req.get('type') in ['P2P', 'StockTransfer'] and req.get('acceptedBy'):
+                 responder_id = req.get('acceptedBy')
+                 bg = req.get('bloodGroup')
+                 units = int(req.get('units', 1))
+                 
+                 if responder_id and bg:
+                     db.inventory.update_one(
+                         {"hospitalId": responder_id},
+                         {"$inc": {bg: units}}
+                     )
+                     print(f"Refunded {units} units of {bg} to {responder_id}")
+
+             # CLEANUP: Remove pending notifications so donors don't see dead alerts
+             db.notifications.delete_many({"relatedRequestId": req_id})
+
         if new_status == 'Completed':
             dataset["completedAt"] = datetime.datetime.now().isoformat()
             
@@ -510,6 +832,7 @@ class HospitalRequestsView(APIView):
             {"$set": dataset}
         )
         
+        # If successfully completed, update inventory logic
         if new_status == 'Completed':
             req = db.requests.find_one({"_id": ObjectId(req_id)})
             if req:
@@ -517,108 +840,73 @@ class HospitalRequestsView(APIView):
                 units = int(req.get('units', 1))
                 bg = req.get('bloodGroup')
                 
-                # Unified Logic: Requester gets stock, AcceptedBy (Donor/Hospital) gives stock
-                donor_id = req.get('acceptedBy')
-                requester_id = req.get('requesterId')
+                # Determine Who is Who
+                if req_type == 'P2P':
+                    # P2P: hospitalId is the TARGET (Donor), requesterId is the SOURCE (Need)
+                    donor_id = req.get('hospitalId')
+                    requester_id = req.get('requesterId')
+                else:
+                    # Emergency/Broadcast: hospitalId is the SOURCE (Need), acceptedBy is the DONOR
+                    donor_id = req.get('acceptedBy')
+                    requester_id = req.get('hospitalId')
 
-                # Fetch Donor Details
-                donor_name = "Unknown Donor"
+                # Fetch Source/Donor Name for consistent records
+                source_name = "External Source"
                 if donor_id:
-                    donor_user = db.users.find_one({"_id": ObjectId(donor_id)})
-                    if donor_user:
-                        donor_name = donor_user.get('name')
+                     donor_obj = db.users.find_one({"_id": ObjectId(donor_id)})
+                     if donor_obj:
+                         source_name = donor_obj.get('name', 'Unknown')
 
+                # 1. Increment Stock for Requester (They received it)
                 if requester_id and bg:
-                    # 1. Update Inventory
                     db.inventory.update_one(
                         {"hospitalId": requester_id},
                         {"$inc": {bg: units}}, 
                         upsert=True
                     )
-                    
-                    # 2. Create Blood Batch Automatically
-                    expiry_date = (datetime.datetime.now() + datetime.timedelta(days=42)).isoformat()
-                    batch_data = {
-                        "hospitalId": requester_id,
-                        "bloodGroup": bg,
-                        "componentType": "Whole Blood",
-                        "units": units,
-                        "collectedDate": datetime.datetime.now().isoformat(),
-                        "expiryDate": expiry_date,
-                        "sourceType": "Donation",
-                        "sourceName": donor_name,
-                        "location": req.get('location') or "Hospital",
-                        "status": "Active",
-                        "createdAt": datetime.datetime.now().isoformat()
-                    }
-                    db.blood_batches.insert_one(batch_data)
-                    
-                # 3. Handle Donor Stats & History
-                if donor_id:
-                     if donor_user and donor_user.get('role') == 'donor':
-                         history_record = {
-                            "donorId": donor_id,
-                            "hospitalId": requester_id,
-                            "hospitalName": req.get('hospitalName') or 'P2P Donation',
-                            "date": datetime.datetime.now().isoformat(),
-                            "units": units,
-                            "bloodGroup": bg,
-                            "type": "P2P Donation" if req_type == 'P2P' else "Emergency Donation", 
-                            "status": "Completed"
-                         }
-                         db.appointments.insert_one(history_record)
-                         
-                         db.users.update_one(
-                             {"_id": ObjectId(donor_id)},
-                             {
-                                 "$set": {"lastDonationDate": datetime.datetime.now().isoformat()},
-                                 "$inc": {"donationCount": units}
-                             }
-                         )
-                     elif donor_id:
-                         # Stock Transfer (Hospital to Hospital) - Reduce sender inventory
-                          db.inventory.update_one(
-                            {"hospitalId": donor_id},
-                            {"$inc": {bg: -units}},
-                            upsert=True
-                        )
-                          
-                          # Auto-Create Batch for the RECEIVING Hospital (requester_id)
-                          # Since they received stock from another hospital
-                          sender_hospital = db.users.find_one({"_id": ObjectId(donor_id)})
-                          source_name = sender_hospital.get('name') if sender_hospital else "Unknown Hospital"
-                          
-                          expiry_date = (datetime.datetime.now() + datetime.timedelta(days=42)).isoformat()
-                          batch_data = {
+                    # AUTO-CREATE BATCH for Requester
+                    try:
+                        batch_data = {
                             "hospitalId": requester_id,
                             "bloodGroup": bg,
                             "componentType": "Whole Blood",
                             "units": units,
                             "collectedDate": datetime.datetime.now().isoformat(),
-                            "expiryDate": expiry_date,
-                            "sourceType": "Transfer", 
+                            "expiryDate": (datetime.datetime.now() + datetime.timedelta(days=35)).isoformat(),
+                            "sourceType": "Transfer" if req_type == 'P2P' else "Donation",
                             "sourceName": source_name,
-                            "location": req.get('location') or "Hospital",
-                            "status": "Active",
-                            "createdAt": datetime.datetime.now().isoformat()
+                            "location": "Incoming Setup", 
+                            "createdAt": datetime.datetime.now().isoformat(),
+                            "status": "Active"
                         }
-                          db.blood_batches.insert_one(batch_data)
+                        db.batches.insert_one(batch_data)
+                    except Exception as e:
+                        print(f"Failed to auto-create batch: {e}")
+                    
+                # 2. Decrement Logic moved to 'Accepted' block for StockTransfer.
+                # For standard donors, no inventory to decrement.
+                pass
+                
+                # 3. Add to Donation History (Appointments Collection for consistency)
+                # This ensures it appears in Donor's dashboard stats which now uses 'appointments'
+                if donor_id:
+                     # Check if it's a user (Donor role)
+                    donor_user = db.users.find_one({"_id": ObjectId(donor_id)})
+                    
+                    if donor_user and donor_user.get('role') == 'donor':
+                        history_record = {
+                            "donorId": donor_id,
+                            "hospitalId": requester_id,
+                            "hospitalName": req.get('hospitalName') or 'Emergency Request',
+                            "date": datetime.datetime.now().isoformat(),
+                            "units": units,
+                            "bloodGroup": bg,
+                            "type": "Emergency Donation", 
+                            "status": "Completed"
+                        }
+                        db.appointments.insert_one(history_record)
 
         return Response({"success": True})
-
-    def delete(self, request):
-        db = get_db()
-        req_id = request.query_params.get('id')
-        if not req_id:
-             return Response({"error": "id parameter required"}, status=400)
-        
-        # Verify ownership (optional but recommended)
-        # user_id = request.query_params.get('userId')
-        
-        result = db.requests.delete_one({"_id": ObjectId(req_id)})
-        if result.deleted_count > 0:
-             return Response({"success": True})
-        return Response({"error": "Request not found"}, status=404)
 
 class HospitalSearchView(APIView):
     def get(self, request):
@@ -626,11 +914,24 @@ class HospitalSearchView(APIView):
         blood_group = request.query_params.get('bloodGroup')
         user_lat = request.query_params.get('lat')
         user_lng = request.query_params.get('lng')
+        requester_id = request.query_params.get('userId') # To exclude self
+        try:
+             min_units = int(request.query_params.get('units', 1))
+        except:
+             min_units = 1
         
         if not blood_group:
              return Response({"error": "bloodGroup required"}, status=400)
 
-        inventory_query = {blood_group: {"$gt": 0}}
+        # 1. Find inventories with stock >= Requested Units (Logic Verification)
+        # Frontend previously filtered this. Now Backend does it.
+        inventory_query = {blood_group: {"$gte": min_units}}
+        
+        # Optimization: We could also filter by hospitalId != requester_id here if we query users...
+        # But inventory links to hospitalId.
+        if requester_id:
+             inventory_query["hospitalId"] = {"$ne": requester_id}
+
         inventories = list(db.inventory.find(inventory_query))
         
         results = []
@@ -638,10 +939,12 @@ class HospitalSearchView(APIView):
             hospital_id = inv.get('hospitalId')
             units = inv.get(blood_group)
             
+            # 2. Get Hospital Details
             if hospital_id:
                 try:
                     hospital = db.users.find_one({"_id": ObjectId(hospital_id)})
                     if hospital:
+                        # Calculate Distance
                         dist_text = "Unknown Distance"
                         dist_val = 999999
                         
@@ -668,9 +971,11 @@ class HospitalSearchView(APIView):
                             "sort_dist": dist_val
                         })
                 except:
-                    continue 
+                    continue  
 
+        # Sort by distance
         results.sort(key=lambda x: x['sort_dist'])
+        
         return Response(results)
 
 class ActiveRequestsView(APIView):
@@ -678,144 +983,65 @@ class ActiveRequestsView(APIView):
         db = get_db()
         user_id = request.query_params.get('userId')
         
-        filter_query = {
-            "status": {"$in": ["Pending", "Active"]},
-        }
-
-        # Filtering Logic (City & Blood Group & Eligibility)
+        # 1. Get User to check Blood Group (Strict Match) & Ignored List
+        user = None
+        ignored_ids = set()
         if user_id:
             try:
                 user = db.users.find_one({"_id": ObjectId(user_id)})
-                if user:
-                    # 1. Eligibility Check (60 Days Rule)
-                    last_donation_str = user.get('lastDonationDate')
-                    is_eligible = True
-                    if last_donation_str:
-                        try:
-                            # Handle typical formats: ISO with 'T' or simple Date 'YYYY-MM-DD'
-                            if 'T' in last_donation_str:
-                                last_date = datetime.datetime.fromisoformat(last_donation_str.replace('Z', '+00:00'))
-                            else:
-                                # Assume YYYY-MM-DD
-                                last_date = datetime.datetime.strptime(last_donation_str, "%Y-%m-%d")
-                                last_date = last_date.replace(tzinfo=datetime.timezone.utc) # Make aware
-
-                            # Ensure we compare apples to apples (UTC)
-                            if last_date.tzinfo is None:
-                                 last_date = last_date.replace(tzinfo=datetime.timezone.utc)
-                                 
-                            now_utc = datetime.datetime.now(datetime.timezone.utc)
-                            sixty_days_ago = now_utc - datetime.timedelta(days=60)
-                            
-                            if last_date > sixty_days_ago:
-                                # Donated recently, not eligible
-                                is_eligible = False 
-                        except Exception as e:
-                            print(f"Eligibility Date Parse Error: {e} for {last_donation_str}")
-                            pass
-                    
-                    if not is_eligible:
-                         return Response({"message": "You are not eligible to donate yet (Cooling Period).", "requests": []})
-
-                    # 2. City Filter (Request Location must match User Location)
-                    # Simple string match for now, could be improved with regex
-                    user_city = user.get('location', '').split(',')[0].strip() # Assuming "City, State"
-                    if user_city:
-                         # Filter requests where location matches user's city OR city is in target 'cities' list
-                         filter_query['$or'] = [
-                            {"location": {"$regex": user_city, "$options": "i"}},
-                            {"cities": {"$regex": user_city, "$options": "i"}}, # For array of strings or string
-                            {"city": {"$regex": user_city, "$options": "i"}}    # Fallback for string field
-                         ]
-                    
-                    # 3. Blood Group Compatibility
-                    # Define compatible donor mapping
-                    compatibility = {
-                        "A+": ["A+", "AB+"],
-                        "O+": ["O+", "A+", "B+", "AB+"],
-                        "B+": ["B+", "AB+"],
-                        "AB+": ["AB+"],
-                        "A-": ["A+", "A-", "AB+", "AB-"],
-                        "O-": ["A+", "A-", "B+", "B-", "AB+", "AB-"],
-                        "B-": ["B+", "B-", "AB+", "AB-"],
-                        "AB-": ["AB+", "AB-"]
-                    }
-                    
-                    # If I am User (Donor), I can DONATE to requests needing my blood type
-                    # So Find Requests where Request.bloodGroup is in My.compatibility?
-                    # Wait, no.
-                    # Requester needs X. Donor has Y.
-                    # Donor Y can give to X if Y is compatible with X.
-                    # Standard Table:
-                    # Donor O- -> All
-                    # Donor O+ -> O+, A+, B+, AB+
-                    
-                    # So we filter requests where the Request.bloodGroup is one that the User can donate to.
-                    user_bg = user.get('bloodGroup')
-                    if user_bg and user_bg in compatibility:
-                         can_donate_to = compatibility[user_bg]
-                         filter_query['bloodGroup'] = {"$in": can_donate_to}
-                         
-            except Exception as e:
-                print(f"Error in ActiveRequests filters: {e}")
-
-        # Exclude own requests if userId provided
-        if user_id:
-             # Logic: Show (Standard Filter AND Pending) OR (Accepted By Me AND Status=Accepted)
-             # But MongoDB queries are easier if we build two branches
-             
-             base_criteria = filter_query.copy() # Contains Location, Blood Group, Eligibility
-             base_criteria['status'] = {"$in": ["Pending", "Active"]}
-             base_criteria['requesterId'] = {"$ne": user_id}
-             # Exclude if I ignored it
-             base_criteria['ignoredBy'] = {"$ne": user_id}
-             
-             # Accepted by me criteria
-             accepted_criteria = {
-                 "acceptedBy": user_id,
-                 "status": "Accepted" # completed are hidden
-             }
-             
-             final_query = {"$or": [base_criteria, accepted_criteria]}
-             
-             cursor = db.requests.find(final_query).sort("date", -1)
-        else:
-            # Fallback for anonymous or other uses
-            filter_query['status'] = "Pending"
-            cursor = db.requests.find(filter_query).sort("date", -1)
+                if user and user.get('ignoredRequests'):
+                     ignored_ids = set(user['ignoredRequests'])
+            except:
+                pass
+            
+        params = {"status": "Active"}
         
-        requests = []
-        for req in cursor:
-            # Manual Filter: Explicitly exclude if requesterId matches user_id (String vs ObjectId safety)
-            # Only if NOT accepted by me (because if accepted by me, I want to see it)
-            is_own_request = False
-            if user_id and req.get('requesterId'):
-                if str(req.get('requesterId')) == str(user_id):
-                     is_own_request = True
+        requests = list(db.requests.find(params).sort("timestamp", -1))
+        
+        valid_requests = []
+        now = datetime.datetime.now(datetime.timezone.utc)
+        
+        for r in requests:
+            # 0. Check Ignored
+            if str(r['_id']) in ignored_ids:
+                continue
+            # Check Expiry if exists
+            if r.get('expiresAt'):
+                 try:
+                     # Handle formats (ISO with/without Z)
+                     exp_str = str(r['expiresAt']).replace('Z', '')
+                     exp_date = datetime.datetime.fromisoformat(exp_str)
+                     if exp_date.tzinfo is None: exp_date = exp_date.replace(tzinfo=datetime.timezone.utc)
+                     
+                     if exp_date < now:
+                         continue # Expired
+                 except:
+                     pass # If bad date, ignore expiry check or safe fail
             
-            # If it's my own request AND I haven't accepted it (which is impossible for own request), hide it.
-            # But wait, if query used $or, we might have matched "acceptedBy": me.
-            # If I accepted it, I should see it.
-            # If I created it, I should NOT see it.
-            if is_own_request:
-                 continue
+            # Logic:
+            # 1. If I accepted it, always show it (even if expired/different group?) - Active requests shouldn't be accepted by me unless incomplete?
+            # Actually, if I accepted it, status is 'Accepted', so params={"status": "Active"} won't find it.
+            # So this view ONLY shows 'Active' new requests.
+            # 'Accepted' requests are in 'MyRequests' view usually.
+            
+            # 2. Strict Blood Group Match
+            if user and user.get('bloodGroup'):
+                if r.get('bloodGroup') != user['bloodGroup']:
+                    continue
 
-            # If P2P, requester is User. If Hospital Req, requester is Hospital.
-            requester_id = req.get('requesterId') or req.get('hospitalId')
+            # Populate Hospital Name
+            requester_id = r.get('requesterId') or r.get('hospitalId')
+            if requester_id:
+                 try:
+                    hospital = db.users.find_one({"_id": ObjectId(requester_id)})
+                    r['hospitalName'] = hospital.get('name') if hospital else "Unknown Hospital"
+                    r['location'] = hospital.get('location') if hospital else "Unknown Location"
+                 except:
+                    r['hospitalName'] = "Unknown Hospital"
             
-            # Populate fallback names if missing
-            if not req.get('hospitalName') or not req.get('location'):
-                if requester_id:
-                     u = db.users.find_one({"_id": ObjectId(requester_id)})
-                     if u:
-                         if not req.get('hospitalName'):
-                             req['hospitalName'] = u.get('name')
-                         if not req.get('location'):
-                             req['location'] = u.get('location')
-
-            requests.append(serialize_doc(req))
+            valid_requests.append(serialize_doc(r))
             
-        return Response(requests)
+        return Response(valid_requests)
 
 class HospitalListView(APIView):
     def get(self, request):
@@ -825,7 +1051,9 @@ class HospitalListView(APIView):
         for h in cursor:
             hospitals.append({
                 "id": str(h['_id']),
-                "name": h.get('name')
+                "name": h.get('name'),
+                "location": h.get('location'),
+                "phone": h.get('phone')
             })
         return Response(hospitals)
 
@@ -844,23 +1072,15 @@ class HospitalAppointmentsView(APIView):
         if not hospital:
             return Response({"error": "Hospital not found"}, status=404)
             
+        # Match appointments by Hospital ID (Robust) or Center Name (Legacy fallback)
+        # Using 'appointments' collection now
         cursor = db.appointments.find({
             "$or": [
                 {"hospitalId": user_id},
                 {"center": hospital.get('name')}
             ]
         }).sort("date", -1)
-        
-        appointments = []
-        for doc in cursor:
-            # Lookup Donor Name if not present
-            if not doc.get('donorName') and doc.get('donorId'):
-                donor = db.users.find_one({"_id": ObjectId(doc.get('donorId'))})
-                if donor:
-                    doc['donorName'] = donor.get('name')
-            
-            appointments.append(serialize_doc(doc))
-            
+        appointments = [serialize_doc(doc) for doc in cursor]
         return Response(appointments)
 
     def post(self, request):
@@ -873,7 +1093,18 @@ class HospitalAppointmentsView(APIView):
         if not appt_id or not new_status:
             return Response({"error": "id and status required"}, status=400)
             
+        # Fetch Existing Appointment
+        appt = db.appointments.find_one({"_id": ObjectId(appt_id)})
+        if not appt:
+             return Response({"error": "Appointment not found"}, status=404)
+             
+        # GUARD: Immutability check
+        if appt.get('status') == 'Completed':
+             return Response({"error": "Cannot modify a completed appointment"}, status=status.HTTP_409_CONFLICT)
+
+        # Update Appointment in 'appointments' collection
         update_data = {"status": new_status}
+        
         if request.data.get('reason'):
             update_data['rejectionReason'] = request.data.get('reason')
             
@@ -882,40 +1113,45 @@ class HospitalAppointmentsView(APIView):
             {"$set": update_data}
         )
         
+        # If successfully completed, update inventory
         if new_status == 'Completed' and hospital_id:
             appt = db.appointments.find_one({"_id": ObjectId(appt_id)})
             if appt:
                 donor_id = appt.get('donorId')
                 donor = db.users.find_one({"_id": ObjectId(donor_id)})
+                
+                # Use donor's blood group if available, else from appointment if stored
                 bg = donor.get('bloodGroup') if donor else appt.get('bloodGroup')
                 units = int(appt.get('units', 1))
                 
-                # 1. Update Inventory
                 if bg:
+                    # 1. Update Inventory Count
                     db.inventory.update_one(
                         {"hospitalId": hospital_id},
                         {"$inc": {bg: units}},
                         upsert=True
                     )
                     
-                    # 2. Create Blood Batch (New Feature)
-                    expiry_date = (datetime.datetime.now() + datetime.timedelta(days=42)).isoformat()
-                    batch_data = {
-                        "hospitalId": hospital_id,
-                        "bloodGroup": bg,
-                        "componentType": "Whole Blood",
-                        "units": units,
-                        "collectedDate": datetime.datetime.now().isoformat(),
-                        "expiryDate": expiry_date,
-                        "sourceType": "Voluntary", 
-                        "sourceName": donor.get('name', 'Voluntary Donor') if donor else 'Voluntary Donor',
-                        "location": "Hospital Camp",
-                        "status": "Active",
-                        "createdAt": datetime.datetime.now().isoformat()
-                    }
-                    db.blood_batches.insert_one(batch_data)
+                    # 2. AUTO-CREATE BATCH (Physical Stock)
+                    try:
+                        batch_data = {
+                            "hospitalId": hospital_id,
+                            "bloodGroup": bg,
+                            "componentType": "Whole Blood", # Default from donation
+                            "units": units,
+                            "collectedDate": datetime.datetime.now().isoformat(),
+                            "expiryDate": (datetime.datetime.now() + datetime.timedelta(days=35)).isoformat(), # Default 35 days
+                            "sourceType": "Donation",
+                            "sourceName": donor.get('name') if donor else "Walk-in Donor",
+                            "location": "In-House",
+                            "createdAt": datetime.datetime.now().isoformat(),
+                            "status": "Active"
+                        }
+                        db.batches.insert_one(batch_data)
+                    except Exception as e:
+                        print(f"Failed to auto-create batch for appointment: {e}")
 
-                # 3. Update Donor Stats
+                # Update Donor's Last Donation Date (Cached on User Profile)
                 if donor_id:
                      db.users.update_one(
                         {"_id": ObjectId(donor_id)},
@@ -923,14 +1159,19 @@ class HospitalAppointmentsView(APIView):
                      )
         
         return Response({"success": True})
+                    
+
 
 class AdminStatsView(APIView):
     def get(self, request):
         db = get_db()
+        
         total_donors = db.users.count_documents({"role": "donor"})
         total_hospitals = db.users.count_documents({"role": "hospital"})
+        # User wants "Active Requests" to be "Accepted" ones (In Progress)
         active_requests = db.requests.count_documents({"status": "Accepted"}) 
         emergency_alerts = db.requests.count_documents({"type": "EMERGENCY_ALERT", "status": "Active"})
+        
         return Response({
             "totalDonors": total_donors,
             "totalHospitals": total_hospitals,
@@ -942,106 +1183,150 @@ class AdminDonorSearchView(APIView):
     def get(self, request):
         db = get_db()
         blood_group = request.query_params.get('bloodGroup')
+        
         query = {"role": "donor"}
         if blood_group:
             query["bloodGroup"] = blood_group
+            
+        # Optional: Filter by Eligibility (60 days rule)
         eligible_only = request.query_params.get('eligibleOnly')
+        
         cursor = db.users.find(query)
         donors = []
+        
         now = datetime.datetime.now(datetime.timezone.utc)
+        
         for doc in cursor:
             is_eligible = True
             last_date_str = doc.get('lastDonationDate')
+            
             if last_date_str:
                 try:
+                    # Handle Z suffix and mixed formats
                     if last_date_str.endswith('Z'):
                          last_date_str = last_date_str[:-1]
+                    
                     last_date = datetime.datetime.fromisoformat(last_date_str)
                     if last_date.tzinfo is None:
                         last_date = last_date.replace(tzinfo=datetime.timezone.utc)
+                        
+                    # Calculate difference
                     diff = now - last_date
                     if diff.days < 60:
                         is_eligible = False
                 except:
                     pass
+            
             doc['isEligible'] = is_eligible
+            # Dynamic Status based on eligibility
             doc['status'] = 'Active' if is_eligible else 'Cooling Period'
+            
             if eligible_only == 'true' and not is_eligible:
                 continue
+                
             donors.append(serialize_doc(doc))
+            
         return Response(donors)
-
-class UserManagementView(APIView):
-    def get(self, request):
-        db = get_db()
-        role = request.query_params.get('role')
-        if not role:
-             return Response({"error": "role required"}, status=400)
-        cursor = db.users.find({"role": role})
-        users = [serialize_doc(doc) for doc in cursor]
-        return Response(users)
-        
-    def delete(self, request):
-        db = get_db()
-        user_id = request.query_params.get('id')
-        if not user_id:
-             return Response({"error": "id required"}, status=400)
-        try:
-            db.users.delete_one({"_id": ObjectId(user_id)})
-            return Response({"success": True})
-        except Exception as e:
-            return Response({"error": str(e)}, status=500)
-
-class AdminAlertsView(APIView):
-    def get(self, request):
-        db = get_db()
-        cursor = db.requests.find({
-            "type": "EMERGENCY_ALERT", 
-            "status": {"$in": ["Active", "Accepted"]}
-        }).sort("date", -1)
-        return Response([serialize_doc(doc) for doc in cursor])
 
 class NotificationView(APIView):
     def get(self, request):
+        """Fetch notifications for a specific user"""
         db = get_db()
         user_id = request.query_params.get('userId')
         if not user_id:
             return Response({"error": "userId required"}, status=400)
-        cursor = db.notifications.find({"userId": user_id}).sort("timestamp", -1)
+            
+        cursor = db.notifications.find({"recipientId": user_id}).sort("timestamp", -1)
         return Response([serialize_doc(n) for n in cursor])
 
     def post(self, request):
+        """Create notifications (Admin sending to Donors)"""
         db = get_db()
-        data = request.data.get('notifications')
+        data = request.data.get('notifications') # Expecting list
+        
         if not data or not isinstance(data, list):
              return Response({"error": "Invalid data format"}, status=400)
+             
+        # Insert all
         db.notifications.insert_many(data)
         return Response({"success": True, "count": len(data)})
 
     def put(self, request):
+        """Update notification status (Read/Accepted)"""
         db = get_db()
         notif_id = request.data.get('id')
         status = request.data.get('status')
+        
+        # 1. Update Notification
         result = db.notifications.find_one_and_update(
             {"_id": ObjectId(notif_id)},
             {"$set": {"status": status}},
             return_document=True
         )
+        
+        # 2. If Accepted, update the original Request/Alert
         if status == 'ACCEPTED' and result and result.get('relatedRequestId'):
             req_id = result.get('relatedRequestId')
-            recipient_id = result.get('recipientId')
-            db.requests.update_one(
-                {"_id": ObjectId(req_id)},
-                {"$set": {
-                    "status": "Accepted",
-                    "acceptedBy": recipient_id,
-                    "acceptedAt": datetime.datetime.now().isoformat()
-                }}
-            )
+            recipient_id = result.get('recipientId') # The donor
+            
+            # Check if request is still active/pending
+            # We update it to 'Accepted' and assign the donor
+            original_req = db.requests.find_one({"_id": ObjectId(req_id)})
+            
+            if original_req:
+                # SAFETY CHECK: Only accept valid, active requests
+                if original_req.get('status') != 'Active':
+                     return Response({"error": "Request is no longer active"}, status=status.HTTP_409_CONFLICT)
+                
+                # Double Check AcceptedBy
+                if original_req.get('acceptedBy'):
+                     return Response({"error": "Request already accepted"}, status=status.HTTP_409_CONFLICT)
+
+                db.requests.update_one(
+                    {"_id": ObjectId(req_id)},
+                    {
+                        "$set": {
+                            "status": "Accepted",
+                            "acceptedBy": recipient_id,
+                            "acceptedAt": datetime.datetime.now().isoformat()
+                        }
+                    }
+                )
+                
+                # NOTIFY REQUESTER (Hospital)
+                requester_id = original_req.get('requesterId') or original_req.get('hospitalId')
+                if requester_id:
+                    requester = db.users.find_one({"_id": ObjectId(requester_id)})
+                    if requester:
+                        # Get Donor Name
+                        donor = db.users.find_one({"_id": ObjectId(recipient_id)})
+                        donor_name = donor.get('name') if donor else "A Donor"
+                        
+                        title = "Donor Responded!"
+                        body = f"{donor_name} is on their way for your emergency request!"
+                        
+                        # DB Notification
+                        db.notifications.insert_one({
+                            "recipientId": str(requester['_id']),
+                            "title": title,
+                            "message": body,
+                            "type": "DONOR_RESPONSE",
+                            "relatedRequestId": req_id,
+                            "status": "UNREAD",
+                            "timestamp": datetime.datetime.now().isoformat()
+                        })
+                        
+                        # FCM Push
+                        if requester.get('fcmToken'):
+                             send_push_multicast([requester['fcmToken']], title, body, {"type": "DONOR_RESPONSE", "requestId": req_id})
+            
+            # 3. Mutual Exclusion: Delete all other notifications for this request
+            # So other donors don't see it anymore
             db.notifications.delete_many({
                 "relatedRequestId": req_id,
                 "_id": {"$ne": ObjectId(notif_id)}
             })
+            
         return Response({"success": True})
 
 class AlertResponseView(APIView):
@@ -1050,881 +1335,708 @@ class AlertResponseView(APIView):
         data = request.data
         alert_id = data.get('alertId')
         donor_id = data.get('donorId')
-        status_val = data.get('status')
-        location = data.get('location') # Coordinates or Address
+        status = data.get('status') # 'Accepted' or 'Declined'
         
         if not alert_id or not donor_id:
-            return Response({"error": "Data missing"}, status=400)
+            return Response({"error": "Missing data"}, status=400)
             
-        # Update Request Status to 'Accepted' immediately
-        # Also store who accepted it and their location
-        donor = db.users.find_one({"_id": ObjectId(donor_id)})
-        
-        update_data = {
-            "status": "Accepted",
-            "acceptedBy": donor_id,
-            "acceptedAt": datetime.datetime.now().isoformat(),
-            "responderName": donor.get('name') if donor else "Unknown",
-            "responderPhone": donor.get('phone') if donor else "N/A",
-            "responderLocation": location
-        }
-        
-        db.requests.update_one(
-            {"_id": ObjectId(alert_id)},
-            {"$set": update_data}
-        )
-        
-        # We could also create a notification for the Requester here if needed
+        if status == 'Accepted':
+            # 1. Fetch Request to check current status
+            req = db.requests.find_one({"_id": ObjectId(alert_id)})
+            if not req:
+                 return Response({"error": "Request not found"}, status=404)
+            
+            # 2. Concurrency Check
+            if req.get('acceptedBy') and req.get('acceptedBy') != donor_id:
+                 return Response({"error": "This request has already been accepted by another donor."}, status=status.HTTP_409_CONFLICT)
+
+            # 3. Update request status and assign donor
+            db.requests.update_one(
+                {"_id": ObjectId(alert_id)},
+                {
+                    "$set": {
+                        "status": "Accepted",
+                        "acceptedBy": donor_id,
+                        "acceptedAt": datetime.datetime.now().isoformat()
+                    }
+                }
+            )
+            
+            # 4. AUTO-BOOK APPOINTMENT
+            # If a donor accepts an emergency, book them in immediately as 'Scheduled'.
+            try:
+                # Fetch Request Details for Hospital Info
+                hospital_id = req.get('requesterId') or req.get('hospitalId') # Who needs it
+                hospital_name = req.get('hospitalName') or "Emergency Center"
+                
+                appt_data = {
+                    "donorId": donor_id,
+                    "hospitalId": hospital_id,
+                    "center": hospital_name,
+                    "date": datetime.datetime.now().isoformat(), # Scheduled for NOW
+                    "bloodGroup": req.get('bloodGroup'),
+                    "type": "Emergency Response",
+                    "status": "Scheduled",
+                    "units": int(req.get('units', 1))
+                }
+                
+                # Check duplication first (optional but safer)
+                existing = db.appointments.find_one({
+                    "donorId": donor_id, 
+                    "status": {"$in": ["Scheduled", "Pending"]},
+                    "type": "Emergency Response",
+                    "date": {"$gte": (datetime.datetime.now() - datetime.timedelta(hours=1)).isoformat()}
+                })
+                
+                if not existing:
+                    db.appointments.insert_one(appt_data)
+                    print(f"Auto-Booked Emergency Appointment for Donor {donor_id}")
+            except Exception as e:
+                print(f"Auto-Book Error: {e}")
         
         return Response({"success": True})
 
-class MyRequestsView(APIView):
+
+
+
+
+        
+
+class ActiveLocationsView(APIView):
     def get(self, request):
+        db = get_db()
+        # Get unique locations from donors
+        locations = db.users.find({"role": "donor"}).distinct("location")
+        # Filter out None/Empty
+        valid_locations = [loc for loc in locations if loc]
+        return Response(valid_locations)
+
+class LocationCountView(APIView):
+    def get(self, request):
+        db = get_db()
+        blood_group = request.query_params.get('bloodGroup')
+        cities = request.query_params.getlist('city') # Support multiple cities
+        
+        query = {"role": "donor"}
+        if blood_group:
+            query["bloodGroup"] = blood_group
+        
+        if cities:
+            # If multiple cities selected
+            query["location"] = {"$in": cities}
+            
+        # Count only Eligible Donors
+        all_donors = db.users.find(query)
+        eligible_count = 0
+        now_naive = datetime.datetime.now() # Local Naive for consistency
+
+        for doc in all_donors:
+            if 'lastDonationDate' not in doc:
+                eligible_count += 1
+                continue
+                
+            last_date_str = doc['lastDonationDate']
+            try:
+                if last_date_str.endswith('Z'): last_date_str = last_date_str[:-1]
+                last_date = datetime.datetime.fromisoformat(last_date_str)
+                # Strip TZ to compare naive-to-naive
+                if last_date.tzinfo is not None: last_date = last_date.replace(tzinfo=None)
+                
+                if (now_naive - last_date).days >= 60:
+                     eligible_count += 1
+            except:
+                # If date parse fails, assume eligible (fail open for counting)
+                eligible_count += 1
+                
+        return Response({"count": eligible_count})
+
+class HospitalDonorSearchView(APIView):
+    def get(self, request):
+        db = get_db()
+        blood_group = request.query_params.get('bloodGroup')
+        cities = request.query_params.getlist('city')
+        
+        query = {"role": "donor"}
+        
+        # 1. Strict Server-Side Filtering
+        if blood_group:
+            query["bloodGroup"] = blood_group
+        if cities:
+            query["location"] = {"$in": cities}
+            
+        # 2. Eligibility Check (Optional but good for P2P)
+        # We return all, but flag them. Or filter?
+        # User wants "eligible donors". Let's filter by 60 days rule here too?
+        # Usually P2P allows messaging anyone, but let's stick to "Eligible" for "Emergency Call"
+        
+        cursor = db.users.find(query)
+        donors = []
+        now = datetime.datetime.now(datetime.timezone.utc)
+        
+        for doc in cursor:
+            # Calculate Eligibility
+            is_eligible = True
+            last_date_str = doc.get('lastDonationDate')
+            if last_date_str:
+                try:
+                    # Robust parsing for ISO format
+                    if last_date_str.endswith('Z'): last_date_str = last_date_str[:-1]
+                    last_date = datetime.datetime.fromisoformat(last_date_str)
+                    
+                    # Ensure last_date is Naive for simple comparison with datetime.now()
+                    if last_date.tzinfo is not None:
+                        last_date = last_date.replace(tzinfo=None)
+                    
+                    now_naive = datetime.datetime.now() # Local Naive
+                    
+                    if (now_naive - last_date).days < 60:
+                        is_eligible = False
+                except Exception as e:
+                    # print(f"Date Parse Error: {e}")
+                    pass
+            
+            # Only return eligible donors for Emergency Call
+            if is_eligible:
+                # Calculate Distance (Mock or Real)
+                # For now just return data, frontend calculates sort? 
+                # User asked to move logic. Distance calc is complex without user lat/lng passed.
+                # If lat/lng passed, we calc.
+                dist_text = "Unknown"
+                
+                # Check for Active Appointment (Booked?)
+                is_booked = db.appointments.find_one({
+                    "donorId": str(doc['_id']),
+                    "status": {"$in": ["Pending", "Scheduled"]}
+                })
+                
+                if not is_booked:
+                    donors.append(serialize_doc(doc))
+                
+        return Response(donors)
+
+
+
+# AdminAnalyticsView Removed (Cleanup)
+
+class ProfileUpdateView(APIView):
+    def post(self, request):
+        """Update User Profile (Password, Avatar, etc.)"""
+        db = get_db()
+        user_id = request.data.get('userId')
+        data = request.data.get('data', {})
+        
+        if not user_id:
+             return Response({"error": "userId required"}, status=400)
+             
+        update_fields = {}
+        
+        # Handle Password Update with Hashing
+        if 'password' in data and data['password']:
+            pwd = data['password']
+            if len(pwd) < 6:
+                 return Response({"error": "Password must be at least 6 characters"}, status=400)
+                 
+            from django.contrib.auth.hashers import make_password
+            update_fields['password'] = make_password(pwd)
+            
+        # Handle other fields (Gender, Name, etc.)
+        for field in ['name', 'phone', 'location', 'gender', 'bloodGroup']:
+            if field in data:
+                # Unique Check for Phone
+                if field == 'phone':
+                     existing = db.users.find_one({"phone": data['phone'], "_id": {"$ne": ObjectId(user_id)}})
+                     if existing:
+                          return Response({"error": "Phone number already in use"}, status=400)
+                update_fields[field] = data[field]
+                
+        if update_fields:
+            db.users.update_one(
+                {"_id": ObjectId(user_id)},
+                {"$set": update_fields}
+            )
+            return Response({"success": True})
+            
+    def delete(self, request):
+        """Allow user to self-delete account"""
         db = get_db()
         user_id = request.query_params.get('userId')
         if not user_id:
              return Response({"error": "userId required"}, status=400)
              
-        cursor = db.requests.find({"requesterId": user_id}).sort("date", -1)
-        my_reqs = [serialize_doc(doc) for doc in cursor]
-        return Response(my_reqs)
-
-class GlobalInventoryView(APIView):
-    def get(self, request):
-         db = get_db()
-         cursor = db.inventory.find({})
-         # Aggregate
-         total = {"A+": 0, "A-": 0, "B+": 0, "B-": 0, "AB+": 0, "AB-": 0, "O+": 0, "O-": 0}
-         for inv in cursor:
-             for key in total:
-                 total[key] += inv.get(key, 0)
-         return Response(total)
-
-class ProfileUpdateView(APIView):
-    def post(self, request):
-        db = get_db()
-        user_id = request.data.get('userId')
-        data = request.data.get('data')
-        db.users.update_one({"_id": ObjectId(user_id)}, {"$set": data})
-        return Response({"success": True})
-
-class AdminDonationHistoryView(APIView):
-    def get(self, request):
-        db = get_db()
-        cursor = db.appointments.find({"status": "Completed"}).sort("date", -1)
-        return Response([serialize_doc(doc) for doc in cursor])
-
-class AdminAnalyticsView(APIView):
-    def get(self, request):
-        # Determine analytics
-        return Response({"success": True}) # minimal for now
-
-class ForgotPasswordView(APIView):
-    def post(self, request):
-        # Mock implementation
-        return Response({"success": True})
-
-# ==========================================
-# NEW FEATURES IMPLEMENTATION
-# ==========================================
-
-class HospitalDonorListView(APIView):
-    """
-    H7: Hospital Viewing Donors (replaces Admin functionality)
-    """
-    def get(self, request):
-        db = get_db()
-        blood_group = request.query_params.get('bloodGroup')
+        # Optional: Archive instead of delete? For now, hard delete as per privacy.
+        result = db.users.delete_one({"_id": ObjectId(user_id)})
         
-        # Handle multiple cities (param can be multiple 'city' keys or comma-separated)
-        cities = request.query_params.getlist('city')
-        if not cities and request.query_params.get('city'):
-             cities = request.query_params.get('city').split(',')
-             
-        query = {"role": "donor"}
-        
-        if blood_group:
-            query["bloodGroup"] = blood_group
+        # CASCADE CLEANUP:
+        if result.deleted_count > 0:
+            # 1. Cancel Active Requests by this user
+            db.requests.update_many(
+                {"requesterId": user_id, "status": "Active"},
+                {"$set": {"status": "Cancelled", "cancelReason": "User Deleted Account"}}
+            )
+            # 2. Cancel Pending Appointments
+            db.appointments.update_many(
+                {"donorId": user_id, "status": "Pending"},
+                {"$set": {"status": "Cancelled"}}
+            )
+            # 3. Delete Notifications
+            db.notifications.delete_many({"recipientId": user_id})
             
-        if cities:
-            # Case-insensitive match for cities
-            city_regexes = [re.compile(f"^{c}$", re.IGNORECASE) for c in cities]
-            query["location"] = {"$in": city_regexes}
-
-        cursor = db.users.find(query)
-        donors = []
-        
-        for d in cursor:
-            # Calculate Eligibility dynamically
-            is_eligible = True
-            last_date_str = d.get('lastDonationDate')
-            if last_date_str:
-                try:
-                    last_date = datetime.datetime.fromisoformat(last_date_str.replace('Z', '+00:00'))
-                    # Ensure timezone awareness
-                    now = datetime.datetime.now(datetime.timezone.utc)
-                    if last_date.tzinfo is None:
-                        last_date = last_date.replace(tzinfo=datetime.timezone.utc)
-                        
-                    diff = now - last_date
-                    if diff.days < 60:
-                        is_eligible = False
-                except Exception as e:
-                    print(f"Date parse error: {e}")
-                    pass
+            # 4. Hospital Specific Cleanup (If Hospital)
+            # Remove Inventory & Batches
+            db.inventory.delete_many({"hospitalId": user_id})
+            db.batches.delete_many({"hospitalId": user_id})
             
-            # Strict Filter: Only return eligible donors
-            if is_eligible:
-                d['eligibility'] = 'Eligible'
-                donors.append(serialize_doc(d))
-                
-        return Response(donors)
-
-class HospitalReportsView(APIView):
-    """
-    H9: Hospital Reports
-    """
-    def get(self, request):
-        db = get_db()
-        user_id = request.query_params.get('userId') # Note: Endpoint might need this param
-        
-        # Mock Aggregation for now, or actual DB calls
-        # 1. Total Units Dispatched
-        dispatched = db.dispatches.count_documents({}) # Filter by hospitalId if needed
-        # 2. Total Units Collected (Stock entries)
-        collected = db.stock_logs.count_documents({"type": "Stock Entry"})
-        # 3. Requests Fulfilled
-        fulfilled = db.requests.count_documents({"status": "Completed"})
-        
-        report_data = {
-            "dispatched": dispatched,
-            "collected": collected,
-            "fulfilled": fulfilled,
-            # Real logs from Stock Logs
-            "logs": [serialize_doc(d) for d in db.stock_logs.find().sort("date", -1).limit(10)]
-        }
-        return Response(report_data)
-
-class HospitalDispatchView(APIView):
-    """
-    H5: Dispatch Blood
-    """
-    def post(self, request):
-        db = get_db()
-        data = request.data
-        data['date'] = datetime.datetime.now().isoformat()
-        data['status'] = 'Dispatched'
-        
-        res = db.dispatches.insert_one(data)
-        
-        # Decrement Inventory logic if needed
-        # Assuming dispatch consumes stock
-        if data.get('hospitalId') and data.get('units') and data.get('bloodGroup'):
-            db.inventory.update_one(
-                {"hospitalId": data.get('hospitalId')},
-                {"$inc": {data.get('bloodGroup'): -int(data.get('units'))}}
+            # Cancel Appointments where they are the Host
+            db.appointments.update_many(
+                {"hospitalId": user_id, "status": {"$in": ["Pending", "Scheduled"]}},
+                {"$set": {"status": "Cancelled", "rejectionReason": "Hospital Closed"}}
             )
             
-        return Response({"success": True, "id": str(res.inserted_id)})
-
-class HospitalReceiveView(APIView):
-    """
-    H6: Receive Blood Confirmation
-    """
-    def post(self, request):
-        db = get_db()
-        data = request.data
-        # Update dispatch status
-        dispatch_id = data.get('dispatchId')
-        if dispatch_id:
-            db.dispatches.update_one(
-                {"_id": ObjectId(dispatch_id)},
-                {"$set": {"status": "Received", "receivedAt": datetime.datetime.now().isoformat()}}
+            # Cancel Requests where they are the Host (hospitalId)
+            db.requests.update_many(
+                 {"hospitalId": user_id, "status": "Active"},
+                 {"$set": {"status": "Cancelled", "cancelReason": "Hospital Closed"}}
             )
-            
-        # Increment Inventory
-        if data.get('hospitalId') and data.get('units') and data.get('bloodGroup'):
-            db.inventory.update_one(
-                {"hospitalId": data.get('hospitalId')},
-                {"$inc": {data.get('bloodGroup'): int(data.get('units'))}},
-                upsert=True
-            )
-            
-            # Log Stock Entry
-            db.stock_logs.insert_one({
-                "hospitalId": data.get('hospitalId'),
-                "bloodGroup": data.get('bloodGroup'),
-                "units": int(data.get('units')),
-                "type": "Stock Entry",
-                "source": "Received Dispatch",
-                "date": datetime.datetime.now().isoformat()
-            })
-            
-        return Response({"success": True})
 
-class DonorP2PRequestView(APIView):
-    """
-    D5: Donor P2P Request
-    """
-    def post(self, request):
-        db = get_db()
-        data = request.data
-        data['date'] = datetime.datetime.now().isoformat()
-        data['status'] = 'Pending'
-        data['type'] = 'P2P' # Explicit type
-        
-        # Ensure we capture requesterId (The Donor)
-        # Should be passed in data
-        
-        res = db.requests.insert_one(data)
-        
-        # BROADCAST NOTIFICATIONS
-        # Find donors in the same city, excluding the requester
-        target_city = data.get('city')
-        requester_id = data.get('requesterId')
-        
-        if target_city:
-            # Case-insensitive city match attempt (or exact match depending on data quality)
-            # Assuming 'location' or 'city' field in User model. 
-            # In RegisterView we saw 'location' field. Let's assume it stores city or address containing city.
-            # For simplicity, we use regex or exact match if location field holds City.
-            
-            potential_donors = db.users.find({
-                "role": "donor", 
-                "location": {"$regex": target_city, "$options": "i"},
-                "_id": {"$ne": ObjectId(requester_id) if requester_id else None}
-            })
-            
-            notifs = []
-            for donor in potential_donors:
-                notifs.append({
-                    "userId": str(donor['_id']),
-                    "message": f"Urgent: {data.get('bloodGroup')} needed at {data.get('hospitalName')} in {target_city}.",
-                    "type": "EMERGENCY_ALERT",
-                    "relatedRequestId": str(res.inserted_id),
-                    "status": "UNREAD",
-                    "timestamp": datetime.datetime.now().isoformat(),
-                    "expiresAt": (datetime.datetime.now() + datetime.timedelta(hours=24)).isoformat()
-                })
-            
-            if notifs:
-                db.notifications.insert_many(notifs)
+        return Response({"success": True, "deleted": result.deleted_count})
 
-        return Response({"success": True, "id": str(res.inserted_id)})
-
-class ActiveLocationsView(APIView):
-    """
-    Get unique locations where donors are registered.
-    """
-    def get(self, request):
-        db = get_db()
-        # Find distinct locations for users with role='donor'
-        locations = db.users.find({"role": "donor"}).distinct("location")
-        # Filter out nulls or empty strings just in case
-        valid_locations = [loc for loc in locations if loc]
-        return Response(valid_locations)
-
-class CompleteRequestView(APIView):
-    """
-    Mark P2P request as completed and record donation history for the responder.
-    """
-    def post(self, request):
-        db = get_db()
-        req_id = request.data.get('requestId')
-        
-        if not req_id:
-            return Response({"error": "requestId required"}, status=400)
-
-        # 1. Update Request Status
-        req = db.requests.find_one_and_update(
-            {"_id": ObjectId(req_id)},
-            {"$set": {"status": "Completed"}},
-            return_document=True
-        )
-        
-        if not req:
-            return Response({"error": "Request not found"}, status=404)
-            
-        # 2. Add to Donor's History (if a responder was assigned)
-        # We look for 'acceptedBy' which stores the donor's ID
-        donor_id = req.get('acceptedBy')
-        if donor_id:
-            history_entry = {
-                "donorId": donor_id,
-                "date": datetime.datetime.now().isoformat(),
-                "hospitalName": req.get('hospitalName'), # Or "P2P Donation"
-                "units": req.get('units', 1),
-                "type": "P2P Donation",
-                "status": "Completed", # Explicitly completed
-                "requestId": req_id
-            }
-            db.appointments.insert_one(history_entry)
-            
-            db.appointments.insert_one(history_entry)
-            
-            # 3. Update Donor Stats
-            db.users.update_one(
-                {"_id": ObjectId(donor_id)},
-                {
-                    "$set": {"lastDonationDate": datetime.datetime.now().isoformat()},
-                    "$inc": {"donationCount": int(req.get('units', 1))}
-                }
-            )
-            
-        return Response({"success": True})
-
-class BloodBatchView(APIView):
-    """
-    Manage individual blood batches (cards).
-    GET: List all active batches for a hospital.
-    POST: Create a new batch (and increment global inventory).
-    """
+class BatchView(APIView):
     def get(self, request):
         db = get_db()
         hospital_id = request.query_params.get('hospitalId')
         if not hospital_id:
             return Response({"error": "hospitalId required"}, status=400)
             
-        # Find active batches (units > 0)
-        cursor = db.blood_batches.find({"hospitalId": hospital_id, "units": {"$gt": 0}}).sort("collectedDate", -1)
-        batches = [serialize_doc(doc) for doc in cursor]
-        return Response(batches)
+        batches = list(db.batches.find({"hospitalId": hospital_id, "units": {"$gt": 0}}))
+        return Response([serialize_doc(b) for b in batches])
 
     def post(self, request):
-        try:
-            db = get_db()
-            data = request.data
-            hospital_id = data.get('hospitalId')
-            
-            print(f"DEBUG: Batch Create Payload: {data}")
-            
-            if not hospital_id:
-                print("DEBUG: Missing hospitalId")
-                return Response({"error": "hospitalId required"}, status=400)
-                
-            try:
-                units = int(data.get('units', 0))
-            except (ValueError, TypeError):
-                print("DEBUG: Invalid units format")
-                return Response({"error": "Invalid units format"}, status=400)
-                
-            if units <= 0:
-                 print("DEBUG: Units must be positive")
-                 return Response({"error": "Units must be > 0"}, status=400)
-
-            # 1. Create Batch
-            batch = {
-                "hospitalId": hospital_id,
-                "bloodGroup": data.get('bloodGroup'),
-                "componentType": data.get('componentType'), # e.g., Whole Blood, Platelets
-                "units": units,
-                "collectedDate": data.get('collectedDate'),
-                "expiryDate": data.get('expiryDate'),
-                "sourceType": data.get('sourceType'),
-                "sourceName": data.get('sourceName'),
-                "location": data.get('location'),
-                "status": "Active",
-                "createdAt": datetime.datetime.now().isoformat()
-            }
-            res = db.blood_batches.insert_one(batch)
-            
-            # 2. Update Global Inventory (Increment)
-            group = data.get('bloodGroup')
-            
-            if group:
-                db.inventory.update_one(
-                    {"hospitalId": hospital_id},
-                    {"$inc": {group: units}},
-                    upsert=True
-                )
-            
-            return Response({"success": True, "id": str(res.inserted_id)})
-        except Exception as e:
-            print(f"ERROR in BloodBatchView: {e}")
-            import traceback
-            traceback.print_exc()
-            return Response({"error": str(e)}, status=500)
+        db = get_db()
+        data = request.data
+        hospital_id = data.get('hospitalId')
+        bg = data.get('bloodGroup')
+        units = int(data.get('units', 0))
         
-
+        if not hospital_id or not bg or units <= 0:
+            return Response({"error": "Invalid Data"}, status=400)
+            
+        # 1. Create Batch
+        data['createdAt'] = datetime.datetime.now().isoformat()
+        data['units'] = units # CRITICAL: Ensure stored as INT for querying
+        
+        # Ensure Expiry
+        if 'expiryDate' not in data:
+             data['expiryDate'] = (datetime.datetime.now() + datetime.timedelta(days=35)).isoformat()
+             
+        res = db.batches.insert_one(data)
+        
+        # 2. Sync with Inventory (Aggregated)
+        db.inventory.update_one(
+            {"hospitalId": hospital_id},
+            {"$inc": {bg: units}},
+            upsert=True
+        )
+        
+        return Response({"success": True, "id": str(res.inserted_id)})
 
 class BatchActionView(APIView):
-    """
-    Handle actions on a batch (e.g., Use Unit).
-    """
     def post(self, request):
         db = get_db()
         batch_id = request.data.get('batchId')
-        action = request.data.get('action') # 'use_unit'
-        quantity = int(request.data.get('quantity', 1))
+        action = request.data.get('action')
+        qty = int(request.data.get('quantity', 1))
         
-        if not batch_id:
-             return Response({"error": "batchId required"}, status=400)
+        hospital_id = request.data.get('hospitalId')
+        
+        if not batch_id or not hospital_id or action not in ['use_unit', 'discard_unit']:
+             return Response({"error": "Invalid Action or Missing IDs"}, status=400)
              
-        batch = db.blood_batches.find_one({"_id": ObjectId(batch_id)})
-        if not batch:
-            return Response({"error": "Batch not found"}, status=404)
-            
-        if action == 'use_unit':
-            if batch['units'] < quantity:
-                return Response({"error": "Not enough units in batch"}, status=400)
-                
-            # 1. Decrement Batch
-            updated_batch = db.blood_batches.find_one_and_update(
-                {"_id": ObjectId(batch_id)},
-                {"$inc": {"units": -quantity}},
-                return_document=True
-            )
-            
-            # If units reach 0, mark as exhausted? Optional, kept simple as units check > 0 in GET
-            
-            # 2. Decrement Global Inventory
-            hospital_id = batch['hospitalId']
-            group = batch['bloodGroup']
-            
-            db.inventory.update_one(
-                {"hospitalId": hospital_id},
-                {"$inc": {group: -quantity}}
-            )
-            
-            return Response({"success": True, "remaining": updated_batch['units']})
-            
-        return Response({"error": "Invalid action"}, status=400)
-
-# ==========================================
-#  MISSING VIEWS IMPLEMENTATION
-# ==========================================
-
-class AlertResponseView(APIView):
-    """
-    Handle Donor Response to Emergency/P2P Request.
-    """
-    def post(self, request):
-        db = get_db()
-        data = request.data
-        req_id = data.get('requestId')
-        responder_id = data.get('userId') # Donor ID
-        status = data.get('status') # 'Accepted' or 'Rejected'
-        msg = data.get('message')
-        
-        if not req_id or not responder_id:
-            return Response({"error": "Request ID and User ID required"}, status=400)
-            
-        # Update Request
-        update_fields = {"status": status}
-        if status == 'Accepted':
-            update_fields["acceptedBy"] = responder_id
-            update_fields["responseMessage"] = msg
-            
-        req = db.requests.find_one_and_update(
-            {"_id": ObjectId(req_id)},
-            {"$set": update_fields},
+        # ATOMIC UPDATE: Decrement only if units >= qty AND Owner matches
+        # Using find_one_and_update ensures no race condition
+        updated_batch = db.batches.find_one_and_update(
+            {"_id": ObjectId(batch_id), "hospitalId": hospital_id, "units": {"$gte": qty}},
+            {"$inc": {"units": -qty}},
             return_document=True
         )
-        
-        if not req:
-             return Response({"error": "Request not found"}, status=404)
 
-        # Notify Requester (Hospital or Donor) if Accepted
-        if status == 'Accepted':
-            requester_id = req.get('requesterId')
-            # Fallback for Hospital-created requests where requesterId might be null/different in old schema
-            if not requester_id and req.get('hospitalId') and not req.get('isBroadcast'):
-                 requester_id = req.get('hospitalId') # If direct P2P? Rare.
-                 
-            if requester_id:
-                responder = db.users.find_one({"_id": ObjectId(responder_id)})
-                resp_name = responder.get('name', 'A Donor') if responder else 'A Donor'
-                
-                notif_text = f"{resp_name} accepted your request!"
-                if msg:
-                    notif_text += f" Message: {msg}"
-                
-                db.notifications.insert_one({
-                    "userId": requester_id,
-                    "message": notif_text,
-                    "type": "REQUEST_ACCEPTED",
-                    "relatedRequestId": req_id,
-                    "status": "UNREAD",
-                    "timestamp": datetime.datetime.now().isoformat()
-                })
-
-        return Response({"success": True})
-
-class IgnoreRequestView(APIView):
-    def post(self, request):
-        db = get_db()
-        data = request.data
-        req_id = data.get('requestId')
-        user_id = data.get('userId')
-        
-        if not req_id or not user_id:
-             return Response({"error": "Missing params"}, status=400)
+        if not updated_batch:
+             return Response({"error": "Not enough units or batch not found"}, status=400)
              
-        db.requests.update_one(
-            {"_id": ObjectId(req_id)},
-            {"$addToSet": {"ignoredBy": user_id}}
-        )
-        return Response({"success": True})
+        new_units = updated_batch['units']
 
-class DonorCountView(APIView):
-    def get(self, request):
-        db = get_db()
-        cities = request.query_params.getlist('city')
-        # Also support comma separated if single param
-        if len(cities) == 1 and ',' in cities[0]:
-             cities = [c.strip() for c in cities[0].split(',')]
+        # 3. Decrement Inventory (Sync)
+        # Inventory is an aggregate, so we just decrement. Even if it goes negative (shouldn't),
+        # it reflects the batch operation.
+        hospital_id = updated_batch.get('hospitalId')
+        bg = updated_batch.get('bloodGroup')
+        
+        if hospital_id and bg:
+             db.inventory.update_one(
+                {"hospitalId": hospital_id},
+                {"$inc": {bg: -qty}}
+             )
+        
+        # Check Depletion
+        if new_units == 0:
+            db.batches.update_one(
+                {"_id": ObjectId(batch_id)},
+                {"$set": {"status": "Depleted"}}
+            )
              
-        if not cities:
-             return Response({"count": 0})
+        return Response({"success": True, "remaining": new_units})
         
-        # 60 Days Rule: Eligible if lastDonationDate is None OR > 60 days ago
-        sixty_days_ago = datetime.datetime.now() - datetime.timedelta(days=60)
-        
-        # Build City Regex (Match ANY of the selected cities)
-        city_regex = "|".join([str(c) for c in cities])
-        
-        # Blood Group Filter
-        req_blood_group = request.query_params.get('bloodGroup')
-        filter_query = {
-            "role": "donor",
-            "location": {"$regex": city_regex, "$options": "i"},
-            "$or": [
-                {"lastDonationDate": None},
-                {"lastDonationDate": {"$eq": ""}},
-                {"lastDonationDate": {"$lt": sixty_days_ago.isoformat()}} 
-            ]
-        }
-        
-        if req_blood_group:
-             # Strict Filtering: Only exact match
-             # "O+ na O+ donors aah mattum filter pnnau"
-             filter_query['bloodGroup'] = req_blood_group
 
-        count = db.users.count_documents(filter_query)
-        return Response({"count": count})
-
-class ActiveLocationsView(APIView):
-    def get(self, request):
-        db = get_db()
-        locations = db.users.distinct("location", {"role": "donor"})
-        cities = set()
-        for loc in locations:
-            if loc:
-                parts = loc.split(',')
-                if len(parts) > 0:
-                    cities.add(parts[0].strip())
-        return Response(list(cities))
-
-class DonorP2PRequestView(APIView):
-    def post(self, request):
-        db = get_db()
-        data = request.data
-        
-        requester_id = data.get('requesterId')
-        cities = data.get('cities') # Now expecting a list
-        
-        # Legacy support for single 'city'
-        if not cities and data.get('city'):
-             cities = [data.get('city')]
-        
-        if not requester_id or not cities:
-            return Response({"error": "Requester ID and City(s) required"}, status=400)
-            
-        req_blood_group = data.get('bloodGroup', '').strip()
-        if not req_blood_group:
-             return Response({"error": "Blood Group is required for P2P requests"}, status=400)
-
-        # 1. Create Request
-        new_req = {
-            "requesterId": requester_id,
-            "patientName": data.get('patientName'),
-            "patientNumber": data.get('patientNumber'),
-            "attenderName": data.get('attenderName'),
-            "attenderNumber": data.get('attenderNumber'),
-            "bloodGroup": req_blood_group,
-            "units": data.get('units'),
-            "urgency": data.get('urgency'),
-            "hospitalName": data.get('hospitalName'),
-            "location": data.get('location'), 
-            "city": ", ".join(cities), # Store as string for display
-            "cities": cities, # Store raw list
-            "status": "Pending",
-            "date": datetime.datetime.now().isoformat(),
-            "type": "P2P"
-        }
-        res = db.requests.insert_one(new_req)
-        req_id = str(res.inserted_id)
-        
-        # 2. Notification Logic
-        # Match ANY city
-        city_regex = "|".join([str(c) for c in cities])
-        
-        query_filter = {
-            "role": "donor",
-            "_id": {"$ne": ObjectId(requester_id)},
-            "location": {"$regex": city_regex, "$options": "i"}
-        }
-        
-        # Strict Filtering: Only exact match as per user request
-        if req_blood_group:
-             query_filter['bloodGroup'] = req_blood_group
-        
-        target_donors = db.users.find(query_filter)
-        
-        donors_list = list(target_donors)
-        notif_msg = f"Urgent: {data.get('bloodGroup')} needed in {'/'.join(cities)}!"
-        
-        notifications_to_insert = []
-        fcm_tokens = []
-        
-        for donor in donors_list:
-            # Check Eligibility (60 days)
-            is_eligible = True
-            last_date_str = donor.get('lastDonationDate')
-            if last_date_str:
-                try:
-                    # Parse ISO format or Date Only
-                    if 'T' in last_date_str:
-                        last_date = datetime.datetime.fromisoformat(last_date_str.replace('Z', '+00:00'))
-                    else:
-                        last_date = datetime.datetime.strptime(last_date_str, "%Y-%m-%d")
-                        
-                    # Ensure timezone awareness for comparison
-                    now = datetime.datetime.now(datetime.timezone.utc)
-                    if last_date.tzinfo is None:
-                        last_date = last_date.replace(tzinfo=datetime.timezone.utc)
-                        
-                    diff = now - last_date
-                    if diff.days < 60:
-                        is_eligible = False
-                except Exception as e:
-                    print(f"Date parse error for donor {donor.get('_id')}: {e}")
-                    pass
-            
-            if not is_eligible:
-                continue
-
-            notifications_to_insert.append({
-                "userId": str(donor['_id']),
-                "message": notif_msg,
-                "type": "URGENT_REQUEST",
-                "requestId": req_id,
-                "status": "UNREAD",
-                "timestamp": datetime.datetime.now().isoformat()
-            })
-            if donor.get('fcmToken'):
-                 fcm_tokens.append(donor.get('fcmToken'))
-
-        if notifications_to_insert:
-            db.notifications.insert_many(notifications_to_insert)
-            notification_count = len(notifications_to_insert)
-
-            # Send FCM Notifications
-            if fcm_tokens:
-                try:
-                    message = messaging.MulticastMessage(
-                        notification=messaging.Notification(
-                            title="Urgent: Blood Needed!",
-                            body=notif_msg,
-                        ),
-                        data={
-                            "type": "URGENT_REQUEST",
-                            "requestId": req_id
-                        },
-                        tokens=fcm_tokens,
-                    )
-                    response = messaging.send_each_for_multicast(message)
-                    print(f"FCM Sent: {response.success_count} success, {response.failure_count} failures")
-                except Exception as e:
-                    print(f"FCM Send Error: {e}")
-            
-        return Response({
-            "success": True, 
-            "requestId": req_id, 
-            "notifiedCount": notification_count
-        })
-
-# Placeholders for Hospital Views to prevent Import Errors
-class HospitalDonorListView(APIView):
-    def get(self, request):
-        db = get_db()
-        blood_group = request.query_params.get('bloodGroup', '').strip()
-        requested_cities = request.query_params.get('city', '')
-        
-        if not blood_group:
-             return Response({"error": "Blood Group is required"}, status=400)
-
-        # Build Query
-        query = {
-            "role": "donor",
-            "bloodGroup": blood_group # Strict Match
-        }
-        
-        # City Filter
-        if requested_cities:
-            # Handle comma-separated list or single city
-            city_list = [c.strip() for c in requested_cities.split(',') if c.strip()]
-            if city_list:
-                city_regex = "|".join([re.escape(c) for c in city_list])
-                query["location"] = {"$regex": city_regex, "$options": "i"}
-
-        donors = db.users.find(query)
-        eligible_donors = []
-        
-        for d in donors:
-             # Check Eligibility (60 days)
-             last_date_str = d.get('lastDonationDate')
-             is_eligible = True
-             if last_date_str:
-                try:
-                    # Handle typical formats: ISO with 'T' or simple Date 'YYYY-MM-DD'
-                    if 'T' in last_date_str:
-                        last_date = datetime.datetime.fromisoformat(last_date_str.replace('Z', '+00:00'))
-                    else:
-                        # Assume YYYY-MM-DD
-                        last_date = datetime.datetime.strptime(last_date_str, "%Y-%m-%d")
-                        last_date = last_date.replace(tzinfo=datetime.timezone.utc) # Make aware
-
-                    # Ensure we compare apples to apples (UTC)
-                    if last_date.tzinfo is None:
-                            last_date = last_date.replace(tzinfo=datetime.timezone.utc)
-                            
-                    now_utc = datetime.datetime.now(datetime.timezone.utc)
-                    sixty_days_ago = now_utc - datetime.timedelta(days=60)
-                    
-                    if last_date > sixty_days_ago:
-                        # Donated recently, not eligible
-                        is_eligible = False 
-                except Exception as e:
-                    print(f"Date parse error for user {d.get('_id')}: {e}")
-                    # Safety Fallback: If we can't verify the date, assume ineligible if it exists? 
-                    # Or assume user entered garbage and is eligible? 
-                    # Let's keep it lenient for now but consistent.
-                    pass
-            
-             if is_eligible:
-                 eligible_donors.append({
-                     "id": str(d['_id']),
-                     "name": d.get('name', 'Anonymous'),
-                     "phone": d.get('phone', 'N/A'), # Requested by user
-                     "bloodGroup": d.get('bloodGroup'),
-                     "location": d.get('location'),
-                     "lastDonationDate": d.get('lastDonationDate')
-                 })
-                 
-        return Response(eligible_donors)
 
 class HospitalReportsView(APIView):
     def get(self, request):
-         return Response({})
-
-class HospitalDispatchView(APIView):
-    def post(self, request):
-         return Response({"success": True})
-
-class HospitalReceiveView(APIView):
-    def post(self, request):
-         return Response({"success": True})
-
-class MyRequestsView(APIView):
-     def get(self, request):
         db = get_db()
-        user_id = request.query_params.get('userId')
-        print(f"DEBUG: MyRequestsView called with userId={user_id}")
-        if not user_id:
-            return Response([])
-        requests = db.requests.find({"requesterId": user_id}).sort("date", -1)
-        res = []
-        for r in requests:
-            r['id'] = str(r['_id'])
-            del r['_id']
-            res.append(r)
-        print(f"DEBUG: Found {len(res)} requests for {user_id}")
-        return Response(res)
-
-class CompleteRequestView(APIView):
-    def post(self, request):
-        db = get_db()
-        req_id = request.data.get('requestId')
+        hospital_id = request.query_params.get('hospitalId')
         
-        if not req_id:
-             return Response({"error": "Request ID required"}, status=400)
+        if not hospital_id:
+            return Response({"error": "hospitalId required"}, status=400)
+            
+        # 1. Total Units Collected (From Batches)
+        pipeline_collected = [
+            {"$match": {"hospitalId": hospital_id}},
+            {"$group": {"_id": None, "total": {"$sum": "$units"}}}
+        ]
+        res_collected = list(db.batches.aggregate(pipeline_collected))
+        total_collected = res_collected[0]['total'] if res_collected else 0
+        
+        # 2. Total Units Dispatched (From Completed Outgoing Requests)
+        # Note: This is a simplification. Real dispatch might track specific batch usage.
+        # But we can look at "Requests Fulfilled" by this hospital.
+        pipeline_dispatched = [
+            {"$match": {
+                "hospitalId": hospital_id, # As Responder/Source
+                "type": {"$in": ["P2P", "StockTransfer", "EMERGENCY_ALERT"]}, # Outgoing types
+                "status": "Completed"
+            }},
+            {"$group": {"_id": None, "total": {"$sum": "$units"}}}
+        ]
+        # Note: In P2P, if 'hospitalId' is the TARGET (Donor), then they dispatched it.
+        # But wait, in P2P creation: 'hospitalId' is target donor. 'requesterId' is source.
+        # So if I am 'hospitalId', I received the request and fulfilled it.
+        # If I am 'requesterId', I asked for it.
+        
+        # Fixing Logic:
+        # Dispatched = requests where I was the 'acceptedBy' (Donor) OR 'hospitalId' (Target in P2P).
+        
+        # Let's count 'Batches Used' instead? 
+        # Actually simplest is to count requests where I am the provider.
+        
+        # A simpler proxy for "Dispatched" is counting how many units are NOT present compared to batches created?
+        # No, "Dispatched" usually means "Sent out".
+        
+        # Let's query requests where acceptedBy == hospitalId and status == Completed
+        pipeline_dispatched = [
+            {"$match": {
+                "acceptedBy": hospital_id, 
+                "status": "Completed"
+            }},
+            {"$group": {"_id": None, "total": {"$sum": "$units"}}}
+        ]
+        res_dispatched = list(db.requests.aggregate(pipeline_dispatched))
+        total_dispatched = res_dispatched[0]['total'] if res_dispatched else 0
+
+        # 3. Batches Expiring Soon (7 Days)
+        now = datetime.datetime.now()
+        next_week = (now + datetime.timedelta(days=7)).isoformat()
+        now_iso = now.isoformat()
+        
+        expiring_soon = db.batches.count_documents({
+            "hospitalId": hospital_id,
+            "units": {"$gt": 0},
+            "expiryDate": {"$gt": now_iso, "$lt": next_week}
+        })
+
+        # 4. Emergency Requests Fulfilled
+        emergency_count = db.requests.count_documents({
+            "acceptedBy": hospital_id,
+            "type": "EMERGENCY_ALERT",
+            "status": {"$in": ["Accepted", "Completed"]}
+        })
+
+        report_data = {
+            "total_units_collected": total_collected,
+            "total_units_dispatched": total_dispatched,
+            "batches_expiring_soon": expiring_soon,
+            "emergency_requests_fulfilled": emergency_count
+        }
+        return Response(report_data)
+
+class BloodDispatchView(APIView):
+    def post(self, request):
+        db = get_db()
+        data = request.data
+        
+        # Support requestId lookup
+        req_id = data.get('reqId') or data.get('requestId')
+        
+        target_id = data.get('targetId')
+        units = data.get('units')
+        bg = data.get('bloodGroup')
+        sender_id = data.get('hospitalId')
+        
+        # If Request ID provided, fetch details from it
+        if req_id:
+            req = db.requests.find_one({"_id": ObjectId(req_id)})
+            if not req:
+                 return Response({"error": "Request not found"}, status=404)
+            
+            # Auto-fill missing data from Request
+            if not target_id: target_id = req.get('requesterId')
+            if not units: units = int(req.get('units', 0))
+            if not bg: bg = req.get('bloodGroup')
+            
+            # Update Request Status
+            db.requests.update_one(
+                {"_id": ObjectId(req_id)},
+                {"$set": {
+                    "status": "Dispatched",
+                    "dispatchDetails": {
+                        "mode": data.get('transportMode'),
+                        "tracker": data.get('trackingId'),
+                        "date": data.get('dispatchDate')
+                    }
+                }}
+            )
+
+        # Validation
+        if not sender_id or not target_id or not units or not bg:
+             return Response({"error": "Missing dispatch details (targetId, units, bloodGroup required if no reqId)"}, status=400)
              
-        # 1. Update Request Status to Completed
-        req = db.requests.find_one_and_update(
-            {"_id": ObjectId(req_id)},
-            {"$set": {"status": "Completed"}},
-            return_document=True
+        # 1. Decrement Sender Inventory
+        db.inventory.update_one(
+            {"hospitalId": sender_id},
+            {"$inc": {bg: -int(units)}}
+        )
+        # Sync Batches (consume FIFO)
+        consume_batches_fifo(db, sender_id, bg, int(units))
+        
+        # 2. Notify Receiver
+        sender_doc = db.users.find_one({"_id": ObjectId(sender_id)})
+        sender_name = sender_doc.get('name', 'Partner Hospital') if sender_doc else 'Partner Hospital'
+        
+        db.notifications.insert_one({
+             "recipientId": target_id,
+             "type": "BLOOD_DISPATCHED",
+             "title": "Blood Dispatched",
+             "message": f"{units} units of {bg} are on the way from {sender_name}.",
+             "reqId": req_id,
+             "status": "UNREAD",
+             "timestamp": datetime.datetime.now().isoformat()
+        })
+        
+        return Response({"success": True, "message": "Blood dispatched successfully"})
+
+class BloodReceiveView(APIView):
+    def post(self, request):
+        db = get_db()
+        data = request.data
+        
+        # Logic: Receiver adds to inventory
+        if not data.get('hospitalId') or not data.get('units'):
+             return Response({"error": "Missing acceptance details"}, status=400)
+             
+        receiver_id = data.get('hospitalId')
+        units = int(data.get('units'))
+        bg = data.get('bloodGroup')
+        
+        # 1. Increment Receiver Inventory
+        db.inventory.update_one(
+            {"hospitalId": receiver_id},
+            {"$inc": {bg: units}},
+            upsert=True
         )
         
-        if not req:
-             return Response({"error": "Request not found"}, status=404)
-        
-        # 2. Update Responder (Donor) Stats
-        responder_id = req.get('acceptedBy')
-        
-        if responder_id:
-            # A. Update User Stats
-            current_date = datetime.datetime.now().isoformat()
-            db.users.update_one(
-                {"_id": ObjectId(responder_id)},
-                {
-                    "$set": {"lastDonationDate": current_date},
-                    "$inc": {"donationCount": 1}
-                }
-            )
-            
-            # B. Add to History (Standardized to Appointments Collection)
-            history_entry = {
-                "donorId": responder_id, # Must match 'donorId' in appointments schema
-                "date": current_date,
-                "type": "P2P Donation",
-                "units": int(req.get('units', 1)),
-                "center": req.get('hospitalName') or req.get('location') or "P2P Location", # mapped to 'center' in history view
-                "bloodGroup": req.get('bloodGroup'),
-                "status": "Completed", # Important for stats count
-                "requestId": req_id
-            }
-            # Use appointments collection as the Single Source of Truth
-            db.appointments.insert_one(history_entry)
+        return Response({"success": True, "message": "Blood received into inventory"})
 
+class ForgotPasswordView(APIView):
+    def post(self, request):
+        # Mock Implementation to complete workflow
+        email = request.data.get('email')
+        if not email:
+            return Response({"error": "Email required"}, status=400)
+            
+        # Check if user exists (Optional security trade-off: Enumeration vs UX)
+        # db = get_db()
+        # user = db.users.find_one({"email": email})
+        # if user:
+        #    send_email(user.email)
+        
+        return Response({"success": True, "message": "If an account exists, a reset link has been sent."})
+
+class DonorIgnoreRequestView(APIView):
+    def post(self, request):
+        db = get_db()
+        user_id = request.data.get('userId')
+        req_id = request.data.get('requestId')
+        
+        if not user_id or not req_id:
+             return Response({"error": "Missing params"}, status=400)
+             
+        # Add to ignored list in User Profile
+        db.users.update_one(
+            {"_id": ObjectId(user_id)},
+            {"$addToSet": {"ignoredRequests": req_id}}
+        )
+        
         return Response({"success": True})
 
-class HospitalSearchView(APIView):
-    """
-    Search for other hospitals with specific blood stock.
-    GET params: bloodGroup, lat, lng (optional)
-    """
+class DonorP2PView(APIView):
+    def get(self, request):
+        """Get My Requests (requests created by this donor)"""
+        db = get_db()
+        user_id = request.query_params.get('userId')
+        if not user_id:
+             return Response({"error": "userId required"}, status=400)
+             
+        # Find requests where requesterId is this user
+        requests = list(db.requests.find({"requesterId": user_id}).sort("timestamp", -1))
+        return Response([serialize_doc(r) for r in requests])
+
+    def post(self, request):
+        """Create P2P Request"""
+        db = get_db()
+        data = request.data
+        
+        # Check if this is a 'complete' action or 'create'
+        if 'requestId' in data and request.path.endswith('complete/'):
+             return self.complete_request(request)
+
+        # Create Logic
+        data['createdAt'] = datetime.datetime.now().isoformat()
+        data['status'] = 'Active' # Fix: Set to Active so it appears in feeds
+        data['type'] = 'P2P_REQUEST'
+        
+        # 1. Calculate Expiration
+        req_time = data.get('requiredTime')
+        if req_time:
+            now = datetime.datetime.now()
+            delta = datetime.timedelta(hours=24) # Default fallback
+            
+            if '30 mins' in req_time:
+                delta = datetime.timedelta(minutes=30)
+            elif '1 Hour' in req_time:
+                delta = datetime.timedelta(hours=1)
+            elif '2 Hours' in req_time:
+                delta = datetime.timedelta(hours=2)
+            elif '4 Hours' in req_time:
+                delta = datetime.timedelta(hours=4)
+            elif 'Today' in req_time:
+                params = now.replace(hour=23, minute=59, second=59)
+                delta = params - now
+            
+            data['expiresAt'] = (now + delta).isoformat()
+
+        res = db.requests.insert_one(data)
+        
+        # 2. Notify Potential Donors
+        # Find donors in target cities with matching blood group
+        try:
+            query = {
+                "role": "donor",
+                "bloodGroup": data.get('bloodGroup'),
+                "_id": {"$ne": ObjectId(data.get('requesterId'))} # Don't notify self
+            }
+            
+            cities = data.get('cities') # Fix: Extract list
+            if not cities and data.get('city'): # Fallback to string split
+                cities = [c.strip() for c in data.get('city').split(',')]
+
+            if cities:
+                query['location'] = {"$in": cities}
+                
+            potential_donors = list(db.users.find(query))
+            donors = []
+            
+            # Filter Ineligible (60-day Rule) - Strict for Notification Spam Prevention
+            now_naive = datetime.datetime.now() 
+            for doc in potential_donors:
+                is_eligible = True
+                if 'lastDonationDate' in doc:
+                    try:
+                        lds = doc['lastDonationDate']
+                        if lds.endswith('Z'): lds = lds[:-1]
+                        ld = datetime.datetime.fromisoformat(lds)
+                        if ld.tzinfo is not None: ld = ld.replace(tzinfo=None)
+                        
+                        if (now_naive - ld).days < 60:
+                            is_eligible = False
+                    except:
+                        pass # Ignore parse errors, treat as eligible
+                
+                if is_eligible:
+                    donors.append(doc)
+            
+            # Send Push
+            tokens = [d['fcmToken'] for d in donors if d.get('fcmToken')]
+            if tokens:
+                send_push_multicast(
+                    tokens, 
+                    "Urgent Blood Request", 
+                    f"A peer needs {data.get('bloodGroup')} blood in {data.get('location', 'your area')}.",
+                    {
+                        "type": "P2P_REQUEST", 
+                        "requestId": str(res.inserted_id)
+                    }
+                )
+                
+            # Create In-App Notifications
+            notifs = []
+            for d in donors:
+                notifs.append({
+                    "recipientId": str(d['_id']),
+                    "type": "P2P_REQUEST",
+                    "title": "Peer Request",
+                    "message": f"Urgent: {data.get('bloodGroup')} needed.",
+                    "relatedRequestId": str(res.inserted_id),
+                    "timestamp": datetime.datetime.now().isoformat(),
+                    "status": "UNREAD"
+                })
+            if notifs:
+                db.notifications.insert_many(notifs)
+                
+        except Exception as e:
+            print(f"P2P Notify Error: {e}")
+        
+        return Response({"success": True, "id": str(res.inserted_id)})
+
+    def complete_request(self, request):
+        db = get_db()
+        req_id = request.data.get('requestId')
+        # Mark as completed
+        db.requests.update_one(
+             {"_id": ObjectId(req_id)},
+             {"$set": {"status": "Completed", "completedAt": datetime.datetime.now().isoformat()}}
+        )
+        return Response({"success": True})
+
+class DonorProfileView(APIView):
     def get(self, request):
         db = get_db()
-        blood_group = request.query_params.get('bloodGroup')
-        
-        if not blood_group:
-             return Response({"error": "Blood Group required"}, status=400)
+        user_id = request.query_params.get('userId')
+        if not user_id:
+             return Response({"error": "userId required"}, status=400)
              
-        # Find Inventory documents where [bloodGroup] > 0
-        query = {
-             blood_group: {"$gt": 0}
-        }
+        user = db.users.find_one({"_id": ObjectId(user_id)})
+        if not user:
+             return Response({"error": "User not found"}, status=404)
+             
+        return Response(serialize_doc(user))
+
+class FCMTokenView(APIView):
+    def post(self, request):
+        db = get_db()
+        user_id = request.data.get('userId')
+        token = request.data.get('token')
         
-        cursor = db.inventory.find(query)
-        
-        results = []
-        for inv in cursor:
-            hospital_id = inv.get('hospitalId')
-            if not hospital_id:
-                continue
-                
-            hospital = db.users.find_one({"_id": ObjectId(hospital_id)})
-            if not hospital:
-                continue
-            
-            results.append({
-                "id": str(hospital['_id']),
-                "name": hospital.get('name'),
-                "location": hospital.get('location'),
-                "units": inv.get(blood_group),
-                "distance": "5 km" # Placeholder
-            })
-            
-        return Response(results)
+        if not user_id or not token:
+             return Response({"error": "userId and token required"}, status=400)
+             
+        db.users.update_one(
+            {"_id": ObjectId(user_id)},
+            {"$set": {"fcmToken": token}}
+        )
+        return Response({"success": True})
