@@ -8,7 +8,7 @@ from .views import (
     BatchView, BatchActionView, 
     HospitalReportsView, BloodDispatchView, BloodReceiveView,
     DonorIgnoreRequestView, DonorP2PView,
-    DonorProfileView, FCMTokenView, TestEmailView
+    DonorProfileView, FCMTokenView, EmailConfigView, TestEmailView
 )
 
 urlpatterns = [
@@ -60,5 +60,6 @@ urlpatterns = [
     path('fcm/token/', FCMTokenView.as_view(), name='fcm-token'),
     
     # Debug
+    path('email-config/', EmailConfigView.as_view(), name='email-config'),
     path('test-email/', TestEmailView.as_view(), name='test-email'),
 ]

@@ -1864,6 +1864,21 @@ class ForgotPasswordView(APIView):
         
         return Response({"success": True, "message": "Password reset link sent to your email."})
 
+class EmailConfigView(APIView):
+    """Simple diagnostic view to check email environment variables"""
+    def get(self, request):
+        from django.http import JsonResponse
+        import os
+        
+        return JsonResponse({
+            "EMAIL_HOST": os.getenv('EMAIL_HOST', 'NOT_SET'),
+            "EMAIL_PORT": os.getenv('EMAIL_PORT', 'NOT_SET'),  
+            "EMAIL_USE_TLS": os.getenv('EMAIL_USE_TLS', 'NOT_SET'),
+            "EMAIL_HOST_USER_SET": bool(os.getenv('EMAIL_HOST_USER')),
+            "EMAIL_HOST_PASSWORD_SET": bool(os.getenv('EMAIL_HOST_PASSWORD')),
+            "DEFAULT_FROM_EMAIL": settings.DEFAULT_FROM_EMAIL if settings.DEFAULT_FROM_EMAIL else "NOT_SET"
+        })
+
 class TestEmailView(APIView):
     """
     Dedicated view to test SMTP settings and return the exact error to the browser.
