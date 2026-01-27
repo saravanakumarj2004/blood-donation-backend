@@ -1,5 +1,6 @@
 from rest_framework.views import APIView
 from django.core.mail import send_mail
+import threading
 from rest_framework.response import Response
 from rest_framework import status
 from .db import get_db
@@ -1820,27 +1821,28 @@ class ForgotPasswordView(APIView):
         if not email:
             return Response({"error": "Email required"}, status=400)
             
+        # Async Email Sending
+        def send_async_email(user_email, user_name):
+            try:
+                 reset_link = "https://blood-donation-frontend-dyrt.onrender.com/reset-password" # Using Render URL
+                 send_mail(
+                    subject="Blood Donation App - Password Reset",
+                    message=f"Hello {user_name},\n\nWe received a request to reset your password.\n\nSince this is a demo environment, please contact the administrator or use the app's secure reset flow if available.\n\nIf you did not request this, please ignore this email.",
+                    from_email=settings.DEFAULT_FROM_EMAIL,
+                    recipient_list=[user_email],
+                    fail_silently=False,
+                )
+                 print(f"Reset email sent to {user_email}")
+            except Exception as e:
+                print(f"Email Sending Error: {e}")
+
         db = get_db()
         user = db.users.find_one({"email": email})
         
         if user:
-            try:
-                # Ideally generate a secure token here.
-                # For this demo, we notify the user.
-                reset_link = "http://localhost:5173/reset-password" # Future implementation
-                
-                send_mail(
-                    subject="Blood Donation App - Password Reset",
-                    message=f"Hello {user.get('name', 'User')},\n\nWe received a request to reset your password.\n\nSince this is a demo environment, please contact the administrator or use the app's secure reset flow if available.\n\nIf you did not request this, please ignore this email.",
-                    from_email=settings.DEFAULT_FROM_EMAIL,
-                    recipient_list=[email],
-                    fail_silently=False,
-                )
-                print(f"Reset email sent to {email}")
-            except Exception as e:
-                print(f"Email Sending Error: {e}")
-                # We intentionally do not expose the error to the user to avoid enumeration/leaking infra issues
-                pass
+            # Threading allows the response to be sent immediately while email sends in background
+            email_thread = threading.Thread(target=send_async_email, args=(email, user.get('name', 'User')))
+            email_thread.start()
         
         return Response({"success": True, "message": "If an account exists, a reset link has been sent."})
 
