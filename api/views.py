@@ -102,10 +102,6 @@ class RegisterView(APIView):
         data['email'] = email # Ensure stored lowercase
         role = data.get('role')
         
-        # Validate Role (Security Hardening)
-        if role.lower() == 'admin':
-             return Response({"message": "Admin registration is restricted."}, status=status.HTTP_403_FORBIDDEN)
-        
         # Check existing
         existing = db.users.find_one({"email": email})
         if existing:
@@ -1162,71 +1158,7 @@ class HospitalAppointmentsView(APIView):
                     
 
 
-class AdminStatsView(APIView):
-    def get(self, request):
-        db = get_db()
-        
-        total_donors = db.users.count_documents({"role": "donor"})
-        total_hospitals = db.users.count_documents({"role": "hospital"})
-        # User wants "Active Requests" to be "Accepted" ones (In Progress)
-        active_requests = db.requests.count_documents({"status": "Accepted"}) 
-        emergency_alerts = db.requests.count_documents({"type": "EMERGENCY_ALERT", "status": "Active"})
-        
-        return Response({
-            "totalDonors": total_donors,
-            "totalHospitals": total_hospitals,
-            "activeRequests": active_requests,
-            "emergencyAlerts": emergency_alerts
-        })
-
-class AdminDonorSearchView(APIView):
-    def get(self, request):
-        db = get_db()
-        blood_group = request.query_params.get('bloodGroup')
-        
-        query = {"role": "donor"}
-        if blood_group:
-            query["bloodGroup"] = blood_group
-            
-        # Optional: Filter by Eligibility (60 days rule)
-        eligible_only = request.query_params.get('eligibleOnly')
-        
-        cursor = db.users.find(query)
-        donors = []
-        
-        now = datetime.datetime.now(datetime.timezone.utc)
-        
-        for doc in cursor:
-            is_eligible = True
-            last_date_str = doc.get('lastDonationDate')
-            
-            if last_date_str:
-                try:
-                    # Handle Z suffix and mixed formats
-                    if last_date_str.endswith('Z'):
-                         last_date_str = last_date_str[:-1]
-                    
-                    last_date = datetime.datetime.fromisoformat(last_date_str)
-                    if last_date.tzinfo is None:
-                        last_date = last_date.replace(tzinfo=datetime.timezone.utc)
-                        
-                    # Calculate difference
-                    diff = now - last_date
-                    if diff.days < 60:
-                        is_eligible = False
-                except:
-                    pass
-            
-            doc['isEligible'] = is_eligible
-            # Dynamic Status based on eligibility
-            doc['status'] = 'Active' if is_eligible else 'Cooling Period'
-            
-            if eligible_only == 'true' and not is_eligible:
-                continue
-                
-            donors.append(serialize_doc(doc))
-            
-        return Response(donors)
+# Admin-related views removed - admin role no longer exists in the application
 
 class NotificationView(APIView):
     def get(self, request):
@@ -1240,7 +1172,7 @@ class NotificationView(APIView):
         return Response([serialize_doc(n) for n in cursor])
 
     def post(self, request):
-        """Create notifications (Admin sending to Donors)"""
+        """Create notifications (System sending to users)"""
         db = get_db()
         data = request.data.get('notifications') # Expecting list
         
@@ -1519,12 +1451,17 @@ class HospitalDonorSearchView(APIView):
 # AdminAnalyticsView Removed (Cleanup)
 
 class ProfileUpdateView(APIView):
-    def post(self, request):
-        """Update User Profile (Password, Avatar, etc.)"""
+    def process_update(self, request, partial=False):
         db = get_db()
         user_id = request.data.get('userId')
         data = request.data.get('data', {})
         
+        # If payload is flat (not nested in data object), support that too for PATCH convenience
+        if not data and not user_id:
+             # Try simple flattening? 
+             # Let's stick to existing protocol: { userId: "...", data: { ... } }
+             pass
+
         if not user_id:
              return Response({"error": "userId required"}, status=400)
              
@@ -1539,8 +1476,13 @@ class ProfileUpdateView(APIView):
             from django.contrib.auth.hashers import make_password
             update_fields['password'] = make_password(pwd)
             
-        # Handle other fields (Gender, Name, etc.)
-        for field in ['name', 'phone', 'location', 'gender', 'bloodGroup']:
+        # Handle other fields (Gender, Name, Bio, etc.)
+        allowed_fields = [
+            'name', 'phone', 'location', 'gender', 'bloodGroup', 
+            'bio', 'occupation', 'dob', 'isAvailable'
+        ]
+        
+        for field in allowed_fields:
             if field in data:
                 # Unique Check for Phone
                 if field == 'phone':
@@ -1555,6 +1497,19 @@ class ProfileUpdateView(APIView):
                 {"$set": update_fields}
             )
             return Response({"success": True})
+        
+        if not partial and not update_fields:
+             return Response({"error": "No fields to update"}, status=400)
+             
+        return Response({"success": True, "message": "No changes detected"})
+
+    def post(self, request):
+        """Update User Profile (Legacy/Full)"""
+        return self.process_update(request, partial=True)
+
+    def patch(self, request):
+        """Partial Update User Profile"""
+        return self.process_update(request, partial=True)
             
     def delete(self, request):
         """Allow user to self-delete account"""
