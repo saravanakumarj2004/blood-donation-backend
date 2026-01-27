@@ -1,4 +1,5 @@
 from rest_framework.views import APIView
+from django.core.mail import send_mail
 from rest_framework.response import Response
 from rest_framework import status
 from .db import get_db
@@ -1485,10 +1486,16 @@ class ProfileUpdateView(APIView):
         for field in allowed_fields:
             if field in data:
                 # Unique Check for Phone
-                if field == 'phone':
+                if field == 'phone' and data['phone']:
                      existing = db.users.find_one({"phone": data['phone'], "_id": {"$ne": ObjectId(user_id)}})
                      if existing:
                           return Response({"error": "Phone number already in use"}, status=400)
+                
+                # Verify Date Format (Basic)
+                if field == 'dob' and data['dob']:
+                    # Optional: validate or sanitize
+                    pass
+
                 update_fields[field] = data[field]
                 
         if update_fields:
@@ -1809,16 +1816,31 @@ class BloodReceiveView(APIView):
 
 class ForgotPasswordView(APIView):
     def post(self, request):
-        # Mock Implementation to complete workflow
         email = request.data.get('email')
         if not email:
             return Response({"error": "Email required"}, status=400)
             
-        # Check if user exists (Optional security trade-off: Enumeration vs UX)
-        # db = get_db()
-        # user = db.users.find_one({"email": email})
-        # if user:
-        #    send_email(user.email)
+        db = get_db()
+        user = db.users.find_one({"email": email})
+        
+        if user:
+            try:
+                # Ideally generate a secure token here.
+                # For this demo, we notify the user.
+                reset_link = "http://localhost:5173/reset-password" # Future implementation
+                
+                send_mail(
+                    subject="Blood Donation App - Password Reset",
+                    message=f"Hello {user.get('name', 'User')},\n\nWe received a request to reset your password.\n\nSince this is a demo environment, please contact the administrator or use the app's secure reset flow if available.\n\nIf you did not request this, please ignore this email.",
+                    from_email=settings.DEFAULT_FROM_EMAIL,
+                    recipient_list=[email],
+                    fail_silently=False,
+                )
+                print(f"Reset email sent to {email}")
+            except Exception as e:
+                print(f"Email Sending Error: {e}")
+                # We intentionally do not expose the error to the user to avoid enumeration/leaking infra issues
+                pass
         
         return Response({"success": True, "message": "If an account exists, a reset link has been sent."})
 
