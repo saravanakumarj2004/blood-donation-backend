@@ -129,7 +129,9 @@ STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
 
 # CORS Configuration
 CORS_ALLOW_ALL_ORIGINS = DEBUG  # Allow all in debug mode
-CORS_ALLOWED_ORIGINS = os.getenv('CORS_ALLOWED_ORIGINS', 'http://localhost:5173').split(',')
+# Robust parsing: split by comma and strip whitespace
+CORS_ALLOWED_ORIGINS = [origin.strip() for origin in os.getenv('CORS_ALLOWED_ORIGINS', 'http://localhost:5173').split(',') if origin.strip()]
+CSRF_TRUSTED_ORIGINS = CORS_ALLOWED_ORIGINS # Allow CSRF for the same origins (Django 4.0+)
 
 # MongoDB Configuration
 MONGO_URI = os.getenv('MONGO_URI', "mongodb://localhost:27017/")
