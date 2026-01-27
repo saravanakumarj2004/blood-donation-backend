@@ -1837,14 +1837,28 @@ class ForgotPasswordView(APIView):
                 print(f"Email Sending Error: {e}")
 
         db = get_db()
-        user = db.users.find_one({"email": email})
+        # Case Insensitive Search
+        user = db.users.find_one({"email": {"$regex": f"^{email}$", "$options": "i"}})
         
-        if user:
-            # Threading allows the response to be sent immediately while email sends in background
-            email_thread = threading.Thread(target=send_async_email, args=(email, user.get('name', 'User')))
-            email_thread.start()
-        
-        return Response({"success": True, "message": "If an account exists, a reset link has been sent."})
+        if not user:
+            # Explicitly tell user if email doesn't exist (Requested by User)
+            return Response({"error": "No account found with this email address."}, status=404)
+
+        # Synchronous Debugging Mode: Send directly to catch error
+        try:
+             reset_link = "https://blood-donation-frontend-dyrt.onrender.com/reset-password" 
+             
+             send_mail(
+                subject="Blood Donation App - Password Reset",
+                message=f"Hello {user.get('name', 'User')},\n\nWe received a request to reset your password.\n\nSince this is a demo environment, please contact the administrator or use the app's secure reset flow if available.\n\nIf you did not request this, please ignore this email.",
+                from_email=settings.DEFAULT_FROM_EMAIL,
+                recipient_list=[email],
+                fail_silently=False,
+            )
+             return Response({"success": True, "message": "Password reset link sent to your email."})
+        except Exception as e:
+            # RETURN THE ACTUAL ERROR TO THE USER FOR DEBUGGING
+            return Response({"error": f"Email Configuration Error: {str(e)}"}, status=500)
 
 class DonorIgnoreRequestView(APIView):
     def post(self, request):
