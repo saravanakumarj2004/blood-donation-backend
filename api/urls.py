@@ -5,7 +5,7 @@ from .views import (
     ActiveRequestsView, HospitalListView, HospitalAppointmentsView, 
     AlertResponseView, NotificationView, ProfileUpdateView,
     ActiveLocationsView, LocationCountView, HospitalDonorSearchView,
-    BatchView, BatchActionView, 
+    BatchView, BatchActionView, OutgoingBatchView,
     HospitalReportsView, BloodDispatchView, BloodReceiveView,
     DonorIgnoreRequestView, DonorP2PView,
     DonorProfileView, FCMTokenView
@@ -27,6 +27,7 @@ urlpatterns = [
     # Batch Management
     path('hospital/batches/', BatchView.as_view(), name='hospital-batches'),
     path('hospital/batches/action/', BatchActionView.as_view(), name='hospital-batch-action'),
+    path('hospital/outgoing-batches/', OutgoingBatchView.as_view(), name='hospital-outgoing-batches'),
 
     # Donor Urgent Requests
     path('donor/active-requests/', ActiveRequestsView.as_view(), name='donor-urgent'),

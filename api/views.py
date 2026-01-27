@@ -62,23 +62,63 @@ def serialize_doc(doc):
 def consume_batches_fifo(db, hospital_id, blood_group, units_needed):
     """
     Deduct units from batches using FIFO (First-In, First-Out) strategy.
-    Returns actual units consumed.
+    Automatically skips expired batches and only consumes from valid units.
+    
+    Returns:
+        {
+            "consumed": int,
+            "source_batches": [{"batchId": str, "unitsUsed": int}, ...]
+        }
     """
     consumed = 0
+    source_batches = []
+    current_time = datetime.datetime.now(datetime.timezone.utc)
+    
     try:
         # Fetch batches sorted by date (Oldest first)
+        # Only fetch batches with units > 0 and status not expired/depleted
         batches = db.batches.find({
             "hospitalId": hospital_id, 
             "bloodGroup": blood_group,
-            "units": {"$gt": 0}
+            "units": {"$gt": 0},
+            "status": {"$nin": ["Expired", "Depleted", "Discarded"]}  # Skip invalid batches
         }).sort("collectedDate", 1)
         
         for batch in batches:
             if consumed >= units_needed:
                 break
-                
+            
+            # Check expiry date before consuming
+            expiry_date_str = batch.get('expiryDate')
+            if expiry_date_str:
+                try:
+                    if isinstance(expiry_date_str, str):
+                        expiry_date = datetime.datetime.fromisoformat(expiry_date_str.replace('Z', '+00:00'))
+                    else:
+                        expiry_date = expiry_date_str
+                    
+                    # Skip expired batch and mark it
+                    if expiry_date.replace(tzinfo=datetime.timezone.utc) < current_time:
+                        db.batches.update_one(
+                            {"_id": batch['_id']},
+                            {"$set": {"status": "Expired"}}
+                        )
+                        print(f"Skipping expired batch {batch['_id']}")
+                        continue  # Skip this batch
+                except Exception as e:
+                    print(f"Expiry check error: {e}")
+                    # Continue with this batch if expiry check fails
+            
             available = batch.get('units', 0)
             to_take = min(available, units_needed - consumed)
+            
+            # Track source batch
+            source_batches.append({
+                "batchId": str(batch['_id']),
+                "unitsUsed": to_take,
+                "collectedDate": batch.get('collectedDate'),
+                "donorId": batch.get('donorId')
+            })
             
             # Atomic update for safety
             db.batches.update_one(
@@ -86,12 +126,22 @@ def consume_batches_fifo(db, hospital_id, blood_group, units_needed):
                 {"$inc": {"units": -to_take}}
             )
             
+            # Mark as depleted if no units remain
+            if available == to_take:
+                db.batches.update_one(
+                    {"_id": batch['_id']},
+                    {"$set": {"status": "Depleted", "depletedAt": datetime.datetime.now().isoformat()}}
+                )
+            
             consumed += to_take
             
     except Exception as e:
         print(f"Batch Consumption Error: {e}")
         
-    return consumed
+    return {
+        "consumed": consumed,
+        "source_batches": source_batches
+    }
 
 class RegisterView(APIView):
     def post(self, request):
@@ -801,7 +851,8 @@ class HospitalRequestsView(APIView):
                 
                 # CRITICAL: Also Consume Batches (Physical Stock) to match Inventory
                 # This prevents "Double Spending" of the same blood units
-                consume_batches_fifo(db, responder_id, bg, units)
+                consumption_result = consume_batches_fifo(db, responder_id, bg, units)
+
 
         if new_status == 'Cancelled' and current_status == 'Accepted':
              # REFUND LOGIC: If it was a StockTransfer/P2P that was accepted, the responder lost stock. Refund it.
@@ -1605,13 +1656,90 @@ class BatchActionView(APIView):
         db = get_db()
         batch_id = request.data.get('batchId')
         action = request.data.get('action')
-        qty = int(request.data.get('quantity', 1))
+        qty = request.data.get('quantity', 1)
         
         hospital_id = request.data.get('hospitalId')
+        patient_id = request.data.get('patientId')  # Optional
+        reference_id = request.data.get('referenceId')  # Optional
+        ward = request.data.get('ward')  # Optional
+        doctor_name = request.data.get('doctorName')  # Optional
+        issue_datetime = request.data.get('issueDateTime')  # Optional
         
+        # ========== VALIDATION LAYER ==========
+        
+        # 1. Basic Input Validation
         if not batch_id or not hospital_id or action not in ['use_unit', 'discard_unit']:
              return Response({"error": "Invalid Action or Missing IDs"}, status=400)
-             
+        
+        # 2. Quantity Validation
+        try:
+            qty = int(qty)
+            if qty < 1:
+                return Response({"error": "Quantity must be at least 1"}, status=400)
+            if qty > 100:  # Safety limit
+                return Response({"error": "Quantity exceeds maximum limit (100 units per transaction)"}, status=400)
+        except (ValueError, TypeError):
+            return Response({"error": "Invalid quantity format"}, status=400)
+        
+        # 3. Fetch Batch for Validation
+        try:
+            batch = db.batches.find_one({"_id": ObjectId(batch_id), "hospitalId": hospital_id})
+        except Exception as e:
+            return Response({"error": "Invalid batch ID format"}, status=400)
+        
+        if not batch:
+            return Response({"error": "Batch not found or does not belong to this hospital"}, status=404)
+        
+        # 4. Batch Status Validation
+        if batch.get('status') == 'Depleted':
+            return Response({"error": "Cannot use units from a depleted batch"}, status=400)
+        
+        if batch.get('status') == 'Discarded':
+            return Response({"error": "Cannot use units from a discarded batch"}, status=400)
+        
+        # 5. Expiry Date Validation (CRITICAL for patient safety)
+        expiry_date_str = batch.get('expiryDate')
+        if expiry_date_str:
+            try:
+                # Parse expiry date (handle both ISO string and datetime)
+                if isinstance(expiry_date_str, str):
+                    expiry_date = datetime.datetime.fromisoformat(expiry_date_str.replace('Z', '+00:00'))
+                else:
+                    expiry_date = expiry_date_str
+                
+                current_time = datetime.datetime.now(datetime.timezone.utc)
+                
+                # Check if batch is expired
+                if expiry_date.replace(tzinfo=datetime.timezone.utc) < current_time:
+                    # Mark as expired
+                    db.batches.update_one(
+                        {"_id": ObjectId(batch_id)},
+                        {"$set": {"status": "Expired"}}
+                    )
+                    return Response({
+                        "error": f"Batch expired on {expiry_date.strftime('%Y-%m-%d')}. Cannot use expired blood units.",
+                        "expiryDate": expiry_date_str
+                    }, status=400)
+                
+                # Warn if expiring within 3 days (still allow, but return warning)
+                days_until_expiry = (expiry_date.replace(tzinfo=datetime.timezone.utc) - current_time).days
+                expiry_warning = None
+                if days_until_expiry <= 3 and action == 'use_unit':
+                    expiry_warning = f"Warning: Batch expires in {days_until_expiry} day(s)"
+            except Exception as e:
+                print(f"Expiry date parsing error: {e}")
+                # Continue if parsing fails (don't block operation)
+        
+        # 6. Quantity Availability Check
+        available_units = batch.get('units', 0)
+        if available_units < qty:
+            return Response({
+                "error": f"Insufficient units. Requested: {qty}, Available: {available_units}",
+                "available": available_units
+            }, status=400)
+        
+        # ========== ATOMIC BATCH UPDATE ==========
+        
         # ATOMIC UPDATE: Decrement only if units >= qty AND Owner matches
         # Using find_one_and_update ensures no race condition
         updated_batch = db.batches.find_one_and_update(
@@ -1621,30 +1749,88 @@ class BatchActionView(APIView):
         )
 
         if not updated_batch:
-             return Response({"error": "Not enough units or batch not found"}, status=400)
+             return Response({"error": "Batch update failed. Insufficient units or concurrent modification."}, status=400)
              
         new_units = updated_batch['units']
-
-        # 3. Decrement Inventory (Sync)
-        # Inventory is an aggregate, so we just decrement. Even if it goes negative (shouldn't),
-        # it reflects the batch operation.
-        hospital_id = updated_batch.get('hospitalId')
         bg = updated_batch.get('bloodGroup')
+
+        # ========== OUTGOING BATCH CARD CREATION ==========
         
+        # CREATE OUTGOING BATCH CARD (for patient usage)
+        if action == 'use_unit':
+            outgoing_batch = {
+                "type": "patient_usage",
+                "hospitalId": hospital_id,
+                "bloodGroup": bg,
+                "quantity": qty,
+                "issuedAt": issue_datetime if issue_datetime else datetime.datetime.now().isoformat(),
+                "patientId": patient_id,
+                "referenceId": reference_id,
+                "ward": ward,
+                "doctorName": doctor_name,
+                "sourceBatchIds": [{
+                    "batchId": str(batch_id),
+                    "unitsUsed": qty,
+                    "collectedDate": updated_batch.get('collectedDate'),
+                    "donorId": updated_batch.get('donorId')
+                }],
+                "createdAt": datetime.datetime.now().isoformat(),
+                "performedBy": hospital_id,  # Audit trail
+                "action": "use_unit"  # Action type for logging
+            }
+            db.outgoing_batches.insert_one(outgoing_batch)
+        elif action == 'discard_unit':
+            # Log discard action for audit trail
+            discard_record = {
+                "type": "discard",
+                "hospitalId": hospital_id,
+                "bloodGroup": bg,
+                "quantity": qty,
+                "discardedAt": datetime.datetime.now().isoformat(),
+                "batchId": str(batch_id),
+                "reason": request.data.get('reason', 'Not specified'),  # Optional reason
+                "performedBy": hospital_id,
+                "createdAt": datetime.datetime.now().isoformat()
+            }
+            db.outgoing_batches.insert_one(discard_record)
+
+        # ========== INVENTORY SYNC ==========
+        
+        # Decrement Inventory (Sync)
         if hospital_id and bg:
              db.inventory.update_one(
                 {"hospitalId": hospital_id},
                 {"$inc": {bg: -qty}}
              )
         
+        # ========== BATCH STATUS UPDATE ==========
+        
         # Check Depletion
         if new_units == 0:
             db.batches.update_one(
                 {"_id": ObjectId(batch_id)},
-                {"$set": {"status": "Depleted"}}
+                {"$set": {
+                    "status": "Depleted" if action == 'use_unit' else "Discarded",
+                    "depletedAt": datetime.datetime.now().isoformat()
+                }}
             )
+        
+        # ========== RESPONSE ==========
+        
+        response_data = {
+            "success": True,
+            "remaining": new_units,
+            "action": action,
+            "quantity": qty,
+            "bloodGroup": bg
+        }
+        
+        # Add expiry warning if applicable
+        if 'expiry_warning' in locals() and expiry_warning:
+            response_data['warning'] = expiry_warning
              
-        return Response({"success": True, "remaining": new_units})
+        return Response(response_data)
+
         
 
 
@@ -1767,36 +1953,80 @@ class BloodDispatchView(APIView):
         if not sender_id or not target_id or not units or not bg:
              return Response({"error": "Missing dispatch details (targetId, units, bloodGroup required if no reqId)"}, status=400)
              
-        # 1. Decrement Sender Inventory
+        # 1. Consume batches using FIFO and get tracking data
+        consumption_result = consume_batches_fifo(db, sender_id, bg, int(units))
+        
+        # 2. CREATE OUTGOING BATCH CARD for sender hospital
+        outgoing_batch = {
+            "type": "transfer_out",
+            "hospitalId": sender_id,
+            "receivingHospitalId": target_id,
+            "bloodGroup": bg,
+            "quantity": int(units),
+            "transferRequestId": req_id,
+            "sourceBatchIds": consumption_result['source_batches'],
+            "issuedAt": datetime.datetime.now().isoformat(),
+            "dispatchDetails": {
+                "mode": data.get('transportMode'),
+                "tracker": data.get('trackingId'),
+                "date": data.get('dispatchDate')
+            },
+            "createdAt": datetime.datetime.now().isoformat()
+        }
+        db.outgoing_batches.insert_one(outgoing_batch)
+        
+        # 3. CREATE INCOMING BATCH CARD for receiver hospital
+        incoming_batch = {
+            "type": "incoming",
+            "hospitalId": target_id,
+            "bloodGroup": bg,
+            "units": int(units),
+            "collectedDate": datetime.datetime.now().isoformat(),
+            "expiryDate": (datetime.datetime.now() + datetime.timedelta(days=35)).isoformat(),
+            "source": "transfer",
+            "transferRequestId": req_id,
+            "fromHospitalId": sender_id,
+            "createdAt": datetime.datetime.now().isoformat()
+        }
+        db.batches.insert_one(incoming_batch)
+        
+        # 4. Decrement Sender Inventory
         db.inventory.update_one(
             {"hospitalId": sender_id},
             {"$inc": {bg: -int(units)}}
         )
-        # Sync Batches (consume FIFO)
-        consume_batches_fifo(db, sender_id, bg, int(units))
         
-        # 2. Notify Receiver
+        # 5. Increment Receiver Inventory
+        db.inventory.update_one(
+            {"hospitalId": target_id},
+            {"$inc": {bg: int(units)}},
+            upsert=True
+        )
+        
+        # 6. Notify Receiver
         sender_doc = db.users.find_one({"_id": ObjectId(sender_id)})
         sender_name = sender_doc.get('name', 'Partner Hospital') if sender_doc else 'Partner Hospital'
         
         db.notifications.insert_one({
              "recipientId": target_id,
              "type": "BLOOD_DISPATCHED",
-             "title": "Blood Dispatched",
-             "message": f"{units} units of {bg} are on the way from {sender_name}.",
+             "title": "Blood Received",
+             "message": f"{units} units of {bg} received from {sender_name}.",
              "reqId": req_id,
              "status": "UNREAD",
              "timestamp": datetime.datetime.now().isoformat()
         })
         
-        return Response({"success": True, "message": "Blood dispatched successfully"})
+        return Response({"success": True, "message": "Blood dispatched and batch cards created"})
 
 class BloodReceiveView(APIView):
     def post(self, request):
         db = get_db()
         data = request.data
         
-        # Logic: Receiver adds to inventory
+        # NOTE: This endpoint is now legacy - BloodDispatchView handles both sides
+        # Keeping for backwards compatibility
+        
         if not data.get('hospitalId') or not data.get('units'):
              return Response({"error": "Missing acceptance details"}, status=400)
              
@@ -1804,7 +2034,7 @@ class BloodReceiveView(APIView):
         units = int(data.get('units'))
         bg = data.get('bloodGroup')
         
-        # 1. Increment Receiver Inventory
+        # Increment Receiver Inventory
         db.inventory.update_one(
             {"hospitalId": receiver_id},
             {"$inc": {bg: units}},
@@ -1812,6 +2042,33 @@ class BloodReceiveView(APIView):
         )
         
         return Response({"success": True, "message": "Blood received into inventory"})
+
+
+class OutgoingBatchView(APIView):
+    """
+    API for viewing outgoing batch cards (patient usage and transfers)
+    GET: List outgoing batches for a hospital
+    """
+    def get(self, request):
+        db = get_db()
+        hospital_id = request.query_params.get('hospitalId')
+        batch_type = request.query_params.get('type')  # Optional: 'patient_usage' or 'transfer_out'
+        
+        if not hospital_id:
+            return Response({"error": "hospitalId required"}, status=400)
+            
+        # Build query
+        query = {"hospitalId": hospital_id}
+        if batch_type:
+            query["type"] = batch_type
+            
+        # Fetch and sort by issue date (newest first)
+        outgoing_batches = list(
+            db.outgoing_batches.find(query).sort("issuedAt", -1).limit(100)
+        )
+        
+        return Response([serialize_doc(b) for b in outgoing_batches])
+
 
 class ForgotPasswordView(APIView):
     """
