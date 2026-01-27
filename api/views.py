@@ -1,6 +1,4 @@
 from rest_framework.views import APIView
-from django.core.mail import send_mail
-import threading
 from rest_framework.response import Response
 from rest_framework import status
 from .db import get_db
@@ -1816,121 +1814,71 @@ class BloodReceiveView(APIView):
         return Response({"success": True, "message": "Blood received into inventory"})
 
 class ForgotPasswordView(APIView):
+    """
+    Three-step password reset flow with security question verification:
+    1. POST with email → Returns security question
+    2. POST with email + securityAnswer → Verifies answer, returns verification token
+    3. POST with email + newPassword + verified=True → Resets password
+    """
     def post(self, request):
-        email = request.data.get('email')
+        from django.contrib.auth.hashers import make_password, check_password
+        
+        email = request.data.get('email', '').strip()
+        security_answer = request.data.get('securityAnswer', '').strip()
+        new_password = request.data.get('newPassword')
+        verified = request.data.get('verified', False)
+        
         if not email:
-            return Response({"error": "Email required"}, status=400)
-            
-        # Async Email Sending
-        def send_async_email(user_email, user_name):
-            try:
-                 reset_link = "https://blood-donation-frontend-dyrt.onrender.com/reset-password" # Using Render URL
-                 send_mail(
-                    subject="Blood Donation App - Password Reset",
-                    message=f"Hello {user_name},\n\nWe received a request to reset your password.\n\nSince this is a demo environment, please contact the administrator or use the app's secure reset flow if available.\n\nIf you did not request this, please ignore this email.",
-                    from_email=settings.DEFAULT_FROM_EMAIL,
-                    recipient_list=[user_email],
-                    fail_silently=False,
-                )
-                 print(f"Reset email sent to {user_email}")
-            except Exception as e:
-                print(f"Email Sending Error: {e}")
-
+            return Response({" error": "Email is required"}, status=400)
+        
         db = get_db()
-        # Case Insensitive Search
+        # Case-insensitive email lookup
         user = db.users.find_one({"email": {"$regex": f"^{email}$", "$options": "i"}})
         
         if not user:
-            # Explicitly tell user if email doesn't exist (Requested by User)
-            return Response({"error": "No account found with this email address."}, status=404)
-
-        # Reverting to Async (Threading) to prevent HTTP Timeouts
-        def send_async_email_safe(user_email, user_name):
-            try:
-                 print(f"Attempting to send email to {user_email}...")
-                 send_mail(
-                    subject="Blood Donation App - Password Reset",
-                    message=f"Hello {user_name},\n\nWe received a request to reset your password.\n\nPlease contact admin or use the secure reset flow.\n\nThank you.",
-                    from_email=settings.DEFAULT_FROM_EMAIL,
-                    recipient_list=[user_email],
-                    fail_silently=False,
-                )
-                 print(f"SUCCESS: Email sent to {user_email}")
-            except Exception as e:
-                print(f"FAILURE: Email Sending Error: {e}")
-
-        email_thread = threading.Thread(target=send_async_email_safe, args=(email, user.get('name', 'User')))
-        email_thread.start()
+            return Response({"error": "No account found with this email address"}, status=404)
         
-        return Response({"success": True, "message": "Password reset link sent to your email."})
-
-class EmailConfigView(APIView):
-    """Simple diagnostic view to check email environment variables"""
-    def get(self, request):
-        from django.http import JsonResponse
-        import os
-        
-        return JsonResponse({
-            "EMAIL_HOST": os.getenv('EMAIL_HOST', 'NOT_SET'),
-            "EMAIL_PORT": os.getenv('EMAIL_PORT', 'NOT_SET'),  
-            "EMAIL_USE_TLS": os.getenv('EMAIL_USE_TLS', 'NOT_SET'),
-            "EMAIL_HOST_USER_SET": bool(os.getenv('EMAIL_HOST_USER')),
-            "EMAIL_HOST_PASSWORD_SET": bool(os.getenv('EMAIL_HOST_PASSWORD')),
-            "DEFAULT_FROM_EMAIL": settings.DEFAULT_FROM_EMAIL if settings.DEFAULT_FROM_EMAIL else "NOT_SET"
-        })
-
-class TestEmailView(APIView):
-    """
-    Dedicated view to test SMTP settings and return the exact error to the browser.
-    Accessible via GET /api/test-email/?email=your@email.com
-    """
-    def get(self, request):
-        from django.http import JsonResponse
-        target_email = request.query_params.get('email')
-        if not target_email:
-            return JsonResponse({"error": "Please provide ?email=... query parameter"}, status=200)
-            
-        try:
-            from django.core.mail import get_connection, send_mail
-            import os
-            
-            # Debugging Info
-            debug_info = {
-                "EMAIL_HOST": os.getenv('EMAIL_HOST', 'default:smtp.gmail.com'),
-                "EMAIL_PORT": os.getenv('EMAIL_PORT', 'default:587'),
-                "EMAIL_USE_TLS": os.getenv('EMAIL_USE_TLS', 'default:True'),
-                "EMAIL_HOST_USER_SET": bool(os.getenv('EMAIL_HOST_USER')),
-                "EMAIL_HOST_PASSWORD_SET": bool(os.getenv('EMAIL_HOST_PASSWORD')),
-            }
-
-            connection = get_connection()
-            # 1. Test Connection
-            connection.open()
-            conn_status = "Connection Successful"
-            connection.close()
-            
-            # 2. Test Sending
-            send_mail(
-                subject="Test Email from Blood Donation App",
-                message="If you are reading this, your SMTP configuration is PERFECT.",
-                from_email=settings.DEFAULT_FROM_EMAIL,
-                recipient_list=[target_email],
-                fail_silently=False,
+        # Step 3: Reset password (requires verified=True)
+        if new_password and verified:
+            hashed_password = make_password(new_password)
+            db.users.update_one(
+                {"_id": user['_id']},
+                {"$set": {"password": hashed_password}}
             )
-            return JsonResponse({
-                "status": "Success",
-                "debug_info": debug_info,
-                "connection": conn_status,
-                "message": f"Email successfully sent to {target_email}. Check your inbox/spam."
-            }, status=200)
-        except Exception as e:
-            import traceback
-            return JsonResponse({
-                "status": "Failed",
-                "error": str(e),
-                "type": type(e).__name__,
-                "traceback": traceback.format_exc()
-            }, status=200)
+            return Response({
+                "success": True,
+                "message": "Password reset successful. You can now log in with your new password."
+            })
+        
+        # Step 2: Verify security answer
+        if security_answer:
+            stored_answer = user.get('securityAnswer', '').strip()
+            
+            # Case-insensitive comparison
+            if stored_answer.lower() == security_answer.lower():
+                return Response({
+                    "success": True,
+                    "verified": True,
+                    "message": "Security answer verified. You can now set a new password."
+                })
+            else:
+                return Response({
+                    "error": "Incorrect security answer. Please try again."
+                }, status=400)
+        
+        # Step 1: Return security question
+        security_question = user.get('securityQuestion', '')
+        
+        if not security_question:
+            return Response({
+                "error": "No security question set for this account. Please contact support."
+            }, status=400)
+        
+        return Response({
+            "success": True,
+            "securityQuestion": security_question,
+            "message": "Email verified. Please answer your security question."
+        })
 
 class DonorIgnoreRequestView(APIView):
     def post(self, request):

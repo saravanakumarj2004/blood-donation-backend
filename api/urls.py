@@ -8,7 +8,7 @@ from .views import (
     BatchView, BatchActionView, 
     HospitalReportsView, BloodDispatchView, BloodReceiveView,
     DonorIgnoreRequestView, DonorP2PView,
-    DonorProfileView, FCMTokenView, EmailConfigView, TestEmailView
+    DonorProfileView, FCMTokenView
 )
 
 urlpatterns = [
@@ -58,8 +58,4 @@ urlpatterns = [
     # App Specific
     path('donor/profile/', DonorProfileView.as_view(), name='donor-profile'),
     path('fcm/token/', FCMTokenView.as_view(), name='fcm-token'),
-    
-    # Debug
-    path('email-config/', EmailConfigView.as_view(), name='email-config'),
-    path('test-email/', TestEmailView.as_view(), name='test-email'),
 ]
