@@ -128,8 +128,8 @@ STATIC_ROOT = BASE_DIR / 'staticfiles'
 STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
 
 # CORS Configuration
-CORS_ALLOW_ALL_ORIGINS = DEBUG  # Allow all in debug mode
-# Robust parsing: split by comma and strip whitespace
+# EXTREME DEBUG MODE: Allow ALL Origins to rule out Env Var issues
+CORS_ALLOW_ALL_ORIGINS = True 
 CORS_ALLOWED_ORIGINS = [origin.strip() for origin in os.getenv('CORS_ALLOWED_ORIGINS', 'http://localhost:5173').split(',') if origin.strip()]
 CSRF_TRUSTED_ORIGINS = CORS_ALLOWED_ORIGINS # Allow CSRF for the same origins (Django 4.0+)
 
