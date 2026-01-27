@@ -1844,21 +1844,65 @@ class ForgotPasswordView(APIView):
             # Explicitly tell user if email doesn't exist (Requested by User)
             return Response({"error": "No account found with this email address."}, status=404)
 
-        # Synchronous Debugging Mode: Send directly to catch error
+        # Reverting to Async (Threading) to prevent HTTP Timeouts
+        def send_async_email_safe(user_email, user_name):
+            try:
+                 print(f"Attempting to send email to {user_email}...")
+                 send_mail(
+                    subject="Blood Donation App - Password Reset",
+                    message=f"Hello {user_name},\n\nWe received a request to reset your password.\n\nPlease contact admin or use the secure reset flow.\n\nThank you.",
+                    from_email=settings.DEFAULT_FROM_EMAIL,
+                    recipient_list=[user_email],
+                    fail_silently=False,
+                )
+                 print(f"SUCCESS: Email sent to {user_email}")
+            except Exception as e:
+                print(f"FAILURE: Email Sending Error: {e}")
+
+        email_thread = threading.Thread(target=send_async_email_safe, args=(email, user.get('name', 'User')))
+        email_thread.start()
+        
+        return Response({"success": True, "message": "Password reset link sent to your email."})
+
+class TestEmailView(APIView):
+    """
+    Dedicated view to test SMTP settings and return the exact error to the browser.
+    Accessible via GET /api/test-email/?email=your@email.com
+    """
+    def get(self, request):
+        target_email = request.query_params.get('email')
+        if not target_email:
+            return Response({"error": "Please provide ?email=... query parameter"}, status=400)
+            
         try:
-             reset_link = "https://blood-donation-frontend-dyrt.onrender.com/reset-password" 
-             
-             send_mail(
-                subject="Blood Donation App - Password Reset",
-                message=f"Hello {user.get('name', 'User')},\n\nWe received a request to reset your password.\n\nSince this is a demo environment, please contact the administrator or use the app's secure reset flow if available.\n\nIf you did not request this, please ignore this email.",
+            from django.core.mail import get_connection
+            connection = get_connection()
+            
+            # 1. Test Connection
+            connection.open()
+            conn_status = "Connection Successful"
+            connection.close()
+            
+            # 2. Test Sending
+            send_mail(
+                subject="Test Email from Blood Donation App",
+                message="If you are reading this, your SMTP configuration is PERFECT.",
                 from_email=settings.DEFAULT_FROM_EMAIL,
-                recipient_list=[email],
+                recipient_list=[target_email],
                 fail_silently=False,
             )
-             return Response({"success": True, "message": "Password reset link sent to your email."})
+            return Response({
+                "status": "Success",
+                "connection": conn_status,
+                "message": f"Email successfully sent to {target_email}. Check your inbox/spam."
+            })
         except Exception as e:
-            # RETURN THE ACTUAL ERROR TO THE USER FOR DEBUGGING
-            return Response({"error": f"Email Configuration Error: {str(e)}"}, status=500)
+            import traceback
+            return Response({
+                "status": "Failed",
+                "error": str(e),
+                "traceback": traceback.format_exc()
+            }, status=500)
 
 class DonorIgnoreRequestView(APIView):
     def post(self, request):
