@@ -1870,14 +1870,25 @@ class TestEmailView(APIView):
     Accessible via GET /api/test-email/?email=your@email.com
     """
     def get(self, request):
+        from django.http import JsonResponse
         target_email = request.query_params.get('email')
         if not target_email:
-            return Response({"error": "Please provide ?email=... query parameter"}, status=400)
+            return JsonResponse({"error": "Please provide ?email=... query parameter"}, status=200)
             
         try:
-            from django.core.mail import get_connection
-            connection = get_connection()
+            from django.core.mail import get_connection, send_mail
+            import os
             
+            # Debugging Info
+            debug_info = {
+                "EMAIL_HOST": os.getenv('EMAIL_HOST', 'default:smtp.gmail.com'),
+                "EMAIL_PORT": os.getenv('EMAIL_PORT', 'default:587'),
+                "EMAIL_USE_TLS": os.getenv('EMAIL_USE_TLS', 'default:True'),
+                "EMAIL_HOST_USER_SET": bool(os.getenv('EMAIL_HOST_USER')),
+                "EMAIL_HOST_PASSWORD_SET": bool(os.getenv('EMAIL_HOST_PASSWORD')),
+            }
+
+            connection = get_connection()
             # 1. Test Connection
             connection.open()
             conn_status = "Connection Successful"
@@ -1891,18 +1902,20 @@ class TestEmailView(APIView):
                 recipient_list=[target_email],
                 fail_silently=False,
             )
-            return Response({
+            return JsonResponse({
                 "status": "Success",
+                "debug_info": debug_info,
                 "connection": conn_status,
                 "message": f"Email successfully sent to {target_email}. Check your inbox/spam."
-            })
+            }, status=200)
         except Exception as e:
             import traceback
-            return Response({
+            return JsonResponse({
                 "status": "Failed",
                 "error": str(e),
+                "type": type(e).__name__,
                 "traceback": traceback.format_exc()
-            }, status=500)
+            }, status=200)
 
 class DonorIgnoreRequestView(APIView):
     def post(self, request):

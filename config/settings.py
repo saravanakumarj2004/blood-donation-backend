@@ -137,10 +137,15 @@ CSRF_TRUSTED_ORIGINS = CORS_ALLOWED_ORIGINS # Allow CSRF for the same origins (D
 MONGO_URI = os.getenv('MONGO_URI', "mongodb://localhost:27017/")
 MONGO_DB_NAME = os.getenv('MONGO_DB_NAME', "blood_donation_db")
 
-# Email Configuration
+# Email Configuration (Robust Parsing)
 EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
 EMAIL_HOST = os.getenv('EMAIL_HOST', 'smtp.gmail.com')
-EMAIL_PORT = int(os.getenv('EMAIL_PORT', 587))
+try:
+    port = os.getenv('EMAIL_PORT', '587').strip()
+    EMAIL_PORT = int(port) if port else 587
+except ValueError:
+    EMAIL_PORT = 587
+    
 EMAIL_USE_TLS = os.getenv('EMAIL_USE_TLS', 'True') == 'True'
 EMAIL_HOST_USER = os.getenv('EMAIL_HOST_USER')
 EMAIL_HOST_PASSWORD = os.getenv('EMAIL_HOST_PASSWORD')
