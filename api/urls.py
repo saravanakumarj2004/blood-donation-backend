@@ -59,4 +59,5 @@ urlpatterns = [
     # App Specific
     path('donor/profile/', DonorProfileView.as_view(), name='donor-profile'),
     path('fcm/token/', FCMTokenView.as_view(), name='fcm-token'),
+    path('donor/eligibility/', EligibilityView.as_view()),
 ]

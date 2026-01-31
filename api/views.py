@@ -1082,7 +1082,8 @@ class ActiveRequestsView(APIView):
                  try:
                     hospital = db.users.find_one({"_id": ObjectId(requester_id)})
                     r['hospitalName'] = hospital.get('name') if hospital else "Unknown Hospital"
-                    r['location'] = hospital.get('location') if hospital else "Unknown Location"
+                    if not r.get('location'):
+                        r['location'] = hospital.get('location') if hospital else "Unknown Location"
                  except:
                     r['hospitalName'] = "Unknown Hospital"
             
@@ -1611,6 +1612,59 @@ class ProfileUpdateView(APIView):
             )
 
         return Response({"success": True, "deleted": result.deleted_count})
+
+class EligibilityView(APIView):
+    def post(self, request):
+        db = get_db()
+        data = request.data
+        
+        weight = int(data.get('weight', 0))
+        has_illness = data.get('hasIllness', False)
+        # 60 Day Rule
+        last_donation_str = data.get('lastDonationDate')
+        
+        # 1. Basic Health Checks
+        if weight < 50:
+            return Response({'status': 'fail', 'msg': 'Minimum weight of 50kg is required.'})
+            
+        if has_illness:
+             return Response({'status': 'fail', 'msg': 'Please consult a doctor regarding your illness/medication.'})
+             
+        # 2. Date Check (60 Days)
+        if last_donation_str:
+            try:
+                if last_donation_str.endswith('Z'): last_donation_str = last_donation_str[:-1]
+                last_date = datetime.datetime.fromisoformat(last_donation_str)
+                if last_date.tzinfo is not None: last_date = last_date.replace(tzinfo=None)
+                
+                days_diff = (datetime.datetime.now() - last_date).days
+                if days_diff < 60:
+                     eligible_date = last_date + datetime.timedelta(days=60)
+                     date_str = eligible_date.strftime("%d %b %Y")
+                     return Response({'status': 'fail', 'msg': f'You donated {days_diff} days ago. Eligible from: {date_str}'})
+            except:
+                pass
+                
+        # 3. Double Check System Records (if userId provided)
+        user_id = data.get('userId')
+        if user_id:
+             user = db.users.find_one({"_id": ObjectId(user_id)})
+             if user and user.get('lastDonationDate'):
+                 try:
+                    sys_date_str = user.get('lastDonationDate')
+                    if sys_date_str.endswith('Z'): sys_date_str = sys_date_str[:-1]
+                    sys_date = datetime.datetime.fromisoformat(sys_date_str)
+                    if sys_date.tzinfo is not None: sys_date = sys_date.replace(tzinfo=None)
+                    
+                    days_diff_sys = (datetime.datetime.now() - sys_date).days
+                    if days_diff_sys < 60:
+                         eligible_date = sys_date + datetime.timedelta(days=60)
+                         date_str = eligible_date.strftime("%d %b %Y")
+                         return Response({'status': 'fail', 'msg': f'System records show recent donation. Eligible from: {date_str}'})
+                 except:
+                     pass
+
+        return Response({'status': 'pass', 'msg': 'You are eligible to donate! 🎉'})
 
 class BatchView(APIView):
     def get(self, request):
