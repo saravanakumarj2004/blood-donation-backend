@@ -2,6 +2,7 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
 from .db import get_db
+from .auth_utils import authenticate_request, require_role
 from bson import ObjectId
 import datetime
 import math
@@ -265,12 +266,13 @@ class LoginView(APIView):
             return Response({"error": f"Internal Server Error: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 class DonorStatsView(APIView):
+    @authenticate_request
+    @require_role('donor')
     def get(self, request):
         db = get_db()
-        user_id = request.query_params.get('userId')
-        if not user_id:
-            return Response({"error": "userId required"}, status=400)
-            
+        # Use validated user_id from JWT token instead of trusting query params
+        user_id = request.user_id
+        
         # Use appointments collection where status is 'Completed'
         donations = db.appointments.count_documents({"donorId": user_id, "status": "Completed"})
         lives_saved = donations * 3 
@@ -328,11 +330,12 @@ class DonorStatsView(APIView):
         })
 
 class DonationHistoryView(APIView):
+    @authenticate_request
+    @require_role('donor')
     def get(self, request):
         db = get_db()
-        user_id = request.query_params.get('userId')
-        if not user_id:
-             return Response({"error": "userId required"}, status=400)
+        # Use validated user_id from JWT
+        user_id = request.user_id
              
         # Fetch ALL appointments for history/bookings tab
         cursor = db.appointments.find({"donorId": user_id}).sort("date", -1)
@@ -2338,15 +2341,12 @@ class DonorP2PView(APIView):
         return Response({"success": True})
 
 class DonorProfileView(APIView):
+    @authenticate_request
     def get(self, request):
         db = get_db()
-        user_id = request.query_params.get('userId')
-        if not user_id:
-             return Response({"error": "userId required"}, status=400)
-             
-        user = db.users.find_one({"_id": ObjectId(user_id)})
-        if not user:
-             return Response({"error": "User not found"}, status=404)
+        # Use validated user from authenticated request
+        user_id = request.user_id
+        user = request.user_data  # Already validated by auth decorator
              
         return Response(serialize_doc(user))
 
