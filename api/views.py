@@ -1230,11 +1230,21 @@ class HospitalAppointmentsView(APIView):
                     except Exception as e:
                         print(f"Failed to auto-create batch for appointment: {e}")
 
-                # Update Donor's Last Donation Date (Cached on User Profile)
+                # Update Donor's Stats (Cached on User Profile)
                 if donor_id:
+                     # Determine donation type from appointment type
+                     appt_type = appt.get('type', 'Voluntary')
+                     donation_type = "Hospital Request" if "Emergency" in appt_type else "Voluntary"
+                     
                      db.users.update_one(
                         {"_id": ObjectId(donor_id)},
-                        {"$set": {"lastDonationDate": datetime.datetime.now().isoformat()}}
+                        {
+                            "$set": {
+                                "lastDonationDate": datetime.datetime.now().isoformat(),
+                                "lastDonationType": donation_type
+                            },
+                            "$inc": {"totalDonations": 1}
+                        }
                      )
         
         return Response({"success": True})
