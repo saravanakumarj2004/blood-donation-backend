@@ -2525,6 +2525,15 @@ class AcceptRequestView(APIView):
                 }}
             )
             
+            # 2. Mark the notification for this donor as READ so it doesn't show in dashboard popup
+            db.notifications.update_many(
+                {
+                    "recipientId": user_id,
+                    "relatedRequestId": req_id
+                },
+                {"$set": {"status": "READ"}}
+            )
+            
             # Notify requester
             requester_id = req.get('requesterId')
             if requester_id:
