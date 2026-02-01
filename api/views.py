@@ -278,21 +278,27 @@ class DonorStatsView(APIView):
         # Use validated user_id from JWT token instead of trusting query params
         user_id = request.user_id
         
-        # Use appointments collection where status is 'Completed'
-        donations = db.appointments.count_documents({"donorId": user_id, "status": "Completed"})
-        lives_saved = donations * 3 
+        # 1. Fetch User Profile for Total Donations (Source of Truth)
+        user = db.users.find_one({"_id": ObjectId(user_id)})
+        
+        # Use explicit counter from User profile if available (more reliable)
+        donations = user.get('totalDonations', 0) if user else 0
+        
+        # Fallback: Count from appointments if profile count is 0 but appointments exist
+        if donations == 0:
+             donations = db.appointments.count_documents({"donorId": user_id, "status": "Completed"})
+             
+        lives_saved = donations * 3
         
         # Calculate Next Donation Date
         try:
-            # 1. Check Appointment History
-            last_appt = db.appointments.find_one(
-                {"donorId": user_id, "status": "Completed"},
-                sort=[("date", -1)]
-            )
-            
-            # 2. Check User Profile (Initial Registration or Cached)
-            user = db.users.find_one({"_id": ObjectId(user_id)})
-            user_last_date_str = user.get('lastDonationDate') if user else None
+             # 2. Check Appointment History for Calculation
+             last_appt = db.appointments.find_one(
+                 {"donorId": user_id, "status": "Completed"},
+                 sort=[("date", -1)]
+             )
+             
+             user_last_date_str = user.get('lastDonationDate') if user else None
 
             # Determine most recent date
             latest_date = None
@@ -2445,8 +2451,8 @@ class DonorP2PView(APIView):
         # 2. Create donation history record for the donor
         # 2. Add to APPOINTMENTS collection (so it shows in History/Stats)
         donation_record = {
-            "donorId": accepted_donor_id,
-            "hospitalId": p2p_request.get('requesterId'),
+            "donorId": str(accepted_donor_id), # Ensure String for query matching
+            "hospitalId": str(p2p_request.get('requesterId')),
             "bloodGroup": p2p_request.get('bloodGroup'),
             "units": int(p2p_request.get('units', 1)),
             "date": now,
