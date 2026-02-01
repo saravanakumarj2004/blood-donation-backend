@@ -1051,7 +1051,7 @@ class ActiveRequestsView(APIView):
             
         params = {"status": "Active"}
         
-        requests = list(db.requests.find(params).sort("timestamp", -1))
+        requests = list(db.requests.find(params).sort("createdAt", -1))
         
         valid_requests = []
         now = datetime.datetime.now(datetime.timezone.utc)
@@ -1073,29 +1073,46 @@ class ActiveRequestsView(APIView):
                  except:
                      pass # If bad date, ignore expiry check or safe fail
             
-            # Logic:
-            # 1. If I accepted it, always show it (even if expired/different group?) - Active requests shouldn't be accepted by me unless incomplete?
-            # Actually, if I accepted it, status is 'Accepted', so params={"status": "Active"} won't find it.
-            # So this view ONLY shows 'Active' new requests.
-            # 'Accepted' requests are in 'MyRequests' view usually.
-            
             # 2. Strict Blood Group Match
             if user and user.get('bloodGroup'):
                 if r.get('bloodGroup') != user['bloodGroup']:
                     continue
 
-            # Populate Hospital Name
+            # Populate Requester Details (name, all form fields)
             requester_id = r.get('requesterId') or r.get('hospitalId')
             if requester_id:
                  try:
-                    hospital = db.users.find_one({"_id": ObjectId(requester_id)})
-                    r['hospitalName'] = hospital.get('name') if hospital else "Unknown Hospital"
-                    if not r.get('location'):
-                        r['location'] = hospital.get('location') if hospital else "Unknown Location"
+                    requester = db.users.find_one({"_id": ObjectId(requester_id)})
+                    if requester:
+                        r['requesterName'] = requester.get('name', 'Anonymous')
+                        r['requesterPhone'] = requester.get('phone')
+                        r['requesterBloodGroup'] = requester.get('bloodGroup')
+                        
+                        # If hospitalName not provided, use requester's location
+                        if not r.get('hospitalName'):
+                            r['hospitalName'] = r.get('hospitalName', 'Unknown Hospital')
+                        if not r.get('location'):
+                            r['location'] = requester.get('location', 'Unknown Location')
+                    else:
+                        r['requesterName'] = "Unknown Requester"
                  except:
-                    r['hospitalName'] = "Unknown Hospital"
+                    r['requesterName'] = "Unknown Requester"
             
-            valid_requests.append(serialize_doc(r))
+            # Ensure all form fields are present (patient details, attender, etc.)
+            req_data = serialize_doc(r)
+            req_data['patientName'] = r.get('patientName', 'N/A')
+            req_data['patientNumber'] = r.get('patientNumber')
+            req_data['attenderName'] = r.get('attenderName')
+            req_data['attenderNumber'] = r.get('attenderNumber')
+            req_data['hospitalName'] = r.get('hospitalName', 'Unknown Hospital')
+            req_data['location'] = r.get('location', 'Unknown Location')
+            req_data['bloodGroup'] = r.get('bloodGroup')
+            req_data['units'] = r.get('units', 1)
+            req_data['urgency'] = r.get('urgency', 'Moderate')
+            req_data['requiredTime'] = r.get('requiredTime')
+            req_data['requesterName'] = r.get('requesterName', 'Anonymous')
+            
+            valid_requests.append(req_data)
             
         return Response(valid_requests)
 
@@ -2263,8 +2280,32 @@ class DonorP2PView(APIView):
              return Response({"error": "userId required"}, status=400)
              
         # Find requests where requesterId is this user
-        requests = list(db.requests.find({"requesterId": user_id}).sort("timestamp", -1))
-        return Response([serialize_doc(r) for r in requests])
+        requests = list(db.requests.find({"requesterId": user_id}).sort("createdAt", -1))
+        
+        # Enhance each request with tracking stats
+        result = []
+        for req in requests:
+            req_data = serialize_doc(req)
+            
+            # Add tracking stats for Active/Rejected requests
+            req_data['notifiedDonorCount'] = req.get('notifiedDonorCount', 0)
+            req_data['rejectedCount'] = len(req.get('rejectedBy', []))
+            req_data['acceptedDonorId'] = req.get('acceptedDonorId')
+            
+            # If donor accepted, include their details
+            if req.get('acceptedDonorId'):
+                try:
+                    donor = db.users.find_one({"_id": ObjectId(req['acceptedDonorId'])})
+                    if donor:
+                        req_data['acceptedDonorName'] = donor.get('name', 'Anonymous Donor')
+                        req_data['acceptedDonorPhone'] = donor.get('phone')
+                        req_data['acceptedDonorLocation'] = donor.get('location')
+                except:
+                    pass
+            
+            result.append(req_data)
+        
+        return Response(result)
 
     def post(self, request):
         """Create P2P Request"""
@@ -2404,6 +2445,79 @@ class DonorProfileView(APIView):
         user = request.user_data  # Already validated by auth decorator
              
         return Response(serialize_doc(user))
+
+class AcceptRequestView(APIView):
+    """Endpoint for donor to accept a P2P request"""
+    def post(self, request):
+        db = get_db()
+        user_id = request.data.get('userId')  # Donor accepting
+        req_id = request.data.get('requestId')
+        
+        if not user_id or not req_id:
+            return Response({"error": "userId and requestId required"}, status=400)
+        
+        # Get the request
+        try:
+            req = db.requests.find_one({"_id": ObjectId(req_id)})
+            if not req:
+                return Response({"error": "Request not found"}, status=404)
+            
+            # Check if already accepted by someone else
+            if req.get('acceptedDonorId'):
+                return Response({"error": "Request already accepted by another donor"}, status=409)
+            
+            # Get donor details
+            donor = db.users.find_one({"_id": ObjectId(user_id)})
+            if not donor:
+                return Response({"error": "Donor not found"}, status=404)
+            
+            # Update request
+            db.requests.update_one(
+                {"_id": ObjectId(req_id)},
+                {"$set": {
+                    "status": "Accepted",
+                    "acceptedDonorId": user_id,
+                    "acceptedAt": datetime.datetime.now().isoformat()
+                }}
+            )
+            
+            # Notify requester
+            requester_id = req.get('requesterId')
+            if requester_id:
+                try:
+                    db.notifications.insert_one({
+                        "recipientId": requester_id,
+                        "type": "REQUEST_ACCEPTED",
+                        "title": "Great News!",
+                        "message": f"{donor.get('name', 'A donor')} has accepted your blood request!",
+                        "relatedRequestId": req_id,
+                        "timestamp": datetime.datetime.now().isoformat(),
+                        "status": "UNREAD"
+                    })
+                    
+                    # Send push notification to requester
+                    requester = db.users.find_one({"_id": ObjectId(requester_id)})
+                    if requester and requester.get('fcmToken'):
+                        send_push_multicast(
+                            [requester['fcmToken']],
+                            "Request Accepted!",
+                            f"{donor.get('name', 'A donor')} will help with your blood request.",
+                            {"type": "REQUEST_ACCEPTED", "requestId": req_id}
+                        )
+                except Exception as e:
+                    print(f"Failed to notify requester: {e}")
+            
+            return Response({
+                "success": True,
+                "donorName": donor.get('name'),
+                "donorPhone": donor.get('phone')
+            })
+            
+        except Exception as e:
+            print(f"Accept request error: {e}")
+            import traceback
+            traceback.print_exc()
+            return Response({"error": str(e)}, status=500)
 
 class FCMTokenView(APIView):
     def post(self, request):

@@ -7,7 +7,7 @@ from .views import (
     ActiveLocationsView, LocationCountView, HospitalDonorSearchView,
     BatchView, BatchActionView, OutgoingBatchView,
     HospitalReportsView, BloodDispatchView, BloodReceiveView,
-    DonorIgnoreRequestView, DonorP2PView,
+    DonorIgnoreRequestView, DonorP2PView, AcceptRequestView,
     DonorProfileView, FCMTokenView
 )
 
@@ -52,6 +52,7 @@ urlpatterns = [
 
     # Donor Logic (P2P & Actions)
     path('donor/ignore-request/', DonorIgnoreRequestView.as_view(), name='donor-ignore'),
+    path('donor/accept-request/', AcceptRequestView.as_view(), name='donor-accept-request'),  # NEW
     path('donor/my-requests/', DonorP2PView.as_view(), name='donor-my-requests'),
     path('donor/requests/', DonorP2PView.as_view(), name='donor-create-request'),
     path('donor/requests/complete/', DonorP2PView.as_view(), name='donor-complete-request'),
