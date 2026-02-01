@@ -292,13 +292,13 @@ class DonorStatsView(APIView):
         
         # Calculate Next Donation Date
         try:
-             # 2. Check Appointment History for Calculation
-             last_appt = db.appointments.find_one(
-                 {"donorId": user_id, "status": "Completed"},
-                 sort=[("date", -1)]
-             )
-             
-             user_last_date_str = user.get('lastDonationDate') if user else None
+            # 2. Check Appointment History for Calculation
+            last_appt = db.appointments.find_one(
+                {"donorId": user_id, "status": "Completed"},
+                sort=[("date", -1)]
+            )
+            
+            user_last_date_str = user.get('lastDonationDate') if user else None
 
             # Determine most recent date
             latest_date = None
