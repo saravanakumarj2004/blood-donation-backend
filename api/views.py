@@ -279,14 +279,27 @@ class DonorStatsView(APIView):
         user_id = request.user_id
         
         # 1. Fetch User Profile for Total Donations (Source of Truth)
-        user = db.users.find_one({"_id": ObjectId(user_id)})
+        try:
+            user = db.users.find_one({"_id": ObjectId(user_id)})
+        except:
+            user = None
         
-        # Use explicit counter from User profile if available (more reliable)
-        donations = user.get('totalDonations', 0) if user else 0
+        # Use explicit counter from User profile
+        profile_count = user.get('totalDonations', 0) if user else 0
         
-        # Fallback: Count from appointments if profile count is 0 but appointments exist
-        if donations == 0:
-             donations = db.appointments.count_documents({"donorId": user_id, "status": "Completed"})
+        # Calculate from DB for verification/self-healing
+        # Support both String and ObjectId query
+        query_id = {"$in": [user_id, ObjectId(user_id)]}
+        db_count = db.appointments.count_documents({"donorId": query_id, "status": "Completed"})
+        
+        # Use the higher value (Self-Healing)
+        donations = max(profile_count, db_count)
+        
+        # Optionally update profile if out of sync (Lazy Correction)
+        if user and db_count > profile_count:
+             try:
+                 db.users.update_one({"_id": ObjectId(user_id)}, {"$set": {"totalDonations": db_count}})
+             except: pass
              
         lives_saved = donations * 3
         
@@ -294,7 +307,7 @@ class DonorStatsView(APIView):
         try:
             # 2. Check Appointment History for Calculation
             last_appt = db.appointments.find_one(
-                {"donorId": user_id, "status": "Completed"},
+                {"donorId": {"$in": [user_id, ObjectId(user_id)]}, "status": "Completed"},
                 sort=[("date", -1)]
             )
             
@@ -347,9 +360,12 @@ class DonationHistoryView(APIView):
         db = get_db()
         # Use validated user_id from JWT
         user_id = request.user_id
-             
+        
+        # Support both String and ObjectId
+        query_id = {"$in": [user_id, ObjectId(user_id)]}     
+        
         # Fetch ALL appointments for history/bookings tab
-        cursor = db.appointments.find({"donorId": user_id}).sort("date", -1)
+        cursor = db.appointments.find({"donorId": query_id}).sort("date", -1)
         history = [serialize_doc(doc) for doc in cursor]
         return Response(history)
         
