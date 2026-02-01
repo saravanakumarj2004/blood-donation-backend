@@ -2427,14 +2427,59 @@ class DonorP2PView(APIView):
         return Response({"success": True, "id": request_id, "notifiedDonors": notified_count})
 
     def complete_request(self, request):
+        """Mark P2P request as completed and update donor's stats"""
         db = get_db()
         req_id = request.data.get('requestId')
-        # Mark as completed
+        
+        # 1. Get the request to find accepted donor
+        p2p_request = db.requests.find_one({"_id": ObjectId(req_id)})
+        if not p2p_request:
+            return Response({"error": "Request not found"}, status=404)
+        
+        accepted_donor_id = p2p_request.get('acceptedDonorId')
+        if not accepted_donor_id:
+            return Response({"error": "No donor accepted this request"}, status=400)
+        
+        now = datetime.datetime.now().isoformat()
+        
+        # 2. Create donation history record for the donor
+        donation_record = {
+            "donorId": accepted_donor_id,
+            "date": now,
+            "hospitalName": p2p_request.get('hospitalName', 'P2P Request'),
+            "bloodGroup": p2p_request.get('bloodGroup'),
+            "units": int(p2p_request.get('units', 1)),
+            "status": "Completed",
+            "type": "P2P_DONATION",  # Mark as P2P donation
+            "requestId": req_id,  # Link to original request
+            "patientName": p2p_request.get('patientName'),
+            "location": p2p_request.get('location'),
+            "createdAt": now
+        }
+        db.donations.insert_one(donation_record)
+        
+        # 3. Update donor stats
+        donor = db.users.find_one({"_id": ObjectId(accepted_donor_id)})
+        if donor:
+            current_total = donor.get('totalDonations', 0)
+            db.users.update_one(
+                {"_id": ObjectId(accepted_donor_id)},
+                {
+                    "$set": {
+                        "totalDonations": current_total + 1,
+                        "lastDonationDate": now,
+                        "lastDonationType": "P2P"
+                    }
+                }
+            )
+        
+        # 4. Mark request as completed
         db.requests.update_one(
              {"_id": ObjectId(req_id)},
-             {"$set": {"status": "Completed", "completedAt": datetime.datetime.now().isoformat()}}
+             {"$set": {"status": "Completed", "completedAt": now}}
         )
-        return Response({"success": True})
+        
+        return Response({"success": True, "donorId": accepted_donor_id, "donationCreated": True})
 
 class DonorProfileView(APIView):
     @authenticate_request
