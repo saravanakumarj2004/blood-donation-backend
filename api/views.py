@@ -1019,6 +1019,22 @@ class HospitalRequestsView(APIView):
                             "status": "Completed"
                         }
                         db.appointments.insert_one(history_record)
+                        
+                        # Explicitly Update User Stats (Immediate Feedback)
+                        # Self-healing will backup this, but direct write is faster/safer
+                        try:
+                            db.users.update_one(
+                                {"_id": ObjectId(donor_id)},
+                                {
+                                    "$inc": {"totalDonations": 1},
+                                    "$set": {
+                                        "lastDonationDate": datetime.datetime.now().isoformat(),
+                                        "lastDonationType": "Emergency Request"
+                                    }
+                                }
+                            )
+                        except Exception as e:
+                            print(f"Failed to update user stats for emergency request: {e}")
 
         return Response({"success": True})
 
