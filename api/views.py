@@ -2443,20 +2443,19 @@ class DonorP2PView(APIView):
         now = datetime.datetime.now().isoformat()
         
         # 2. Create donation history record for the donor
+        # 2. Add to APPOINTMENTS collection (so it shows in History/Stats)
         donation_record = {
             "donorId": accepted_donor_id,
-            "date": now,
-            "hospitalName": p2p_request.get('hospitalName', 'P2P Request'),
+            "hospitalId": p2p_request.get('requesterId'),
             "bloodGroup": p2p_request.get('bloodGroup'),
             "units": int(p2p_request.get('units', 1)),
-            "status": "Completed",
-            "type": "P2P_DONATION",  # Mark as P2P donation
-            "requestId": req_id,  # Link to original request
-            "patientName": p2p_request.get('patientName'),
-            "location": p2p_request.get('location'),
-            "createdAt": now
+            "date": now,
+            "status": "Completed", 
+            "type": "P2P Donation",
+            "center": p2p_request.get('location') or p2p_request.get('hospitalName') or "P2P Request",
+            "requestId": req_id
         }
-        db.donations.insert_one(donation_record)
+        db.appointments.insert_one(donation_record)
         
         # 3. Update donor stats
         donor = db.users.find_one({"_id": ObjectId(accepted_donor_id)})
