@@ -950,10 +950,15 @@ class HospitalRequestsView(APIView):
                 bg = req.get('bloodGroup')
                 
                 # Determine Who is Who
+                # Determine Who is Who
                 if req_type == 'P2P':
-                    # P2P: hospitalId is the TARGET (Donor), requesterId is the SOURCE (Need)
-                    donor_id = req.get('hospitalId')
+                    # P2P: Requester is the Hospital receiving blood. acceptedBy is the Donor.
+                    donor_id = req.get('acceptedDonorId') or req.get('acceptedBy')
                     requester_id = req.get('requesterId')
+                elif req_type == 'StockTransfer':
+                     # Transfer: Requester is Receiver. acceptedBy is the Sending Hospital.
+                     donor_id = req.get('acceptedBy')
+                     requester_id = req.get('requesterId')
                 else:
                     # Emergency/Broadcast: hospitalId is the SOURCE (Need), acceptedBy is the DONOR
                     donor_id = req.get('acceptedBy')
@@ -982,7 +987,7 @@ class HospitalRequestsView(APIView):
                             "units": units,
                             "collectedDate": datetime.datetime.now().isoformat(),
                             "expiryDate": (datetime.datetime.now() + datetime.timedelta(days=35)).isoformat(),
-                            "sourceType": "Transfer" if req_type == 'P2P' else "Donation",
+                            "sourceType": "Transfer" if req_type in ['P2P', 'StockTransfer'] else "Donation",
                             "sourceName": source_name,
                             "location": "Incoming Setup", 
                             "createdAt": datetime.datetime.now().isoformat(),
