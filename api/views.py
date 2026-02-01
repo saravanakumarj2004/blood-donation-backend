@@ -323,11 +323,43 @@ class DonorStatsView(APIView):
             if user_last_date_str:
                 try:
                     u_date = datetime.datetime.fromisoformat(user_last_date_str.replace('Z', '+00:00'))
+                    
+                    # SELF-HEALING: If DB has a newer date than Profile, update Profile
+                    if latest_date and latest_date > u_date:
+                        # DB is fresher, use it and update profile
+                        try:
+                            db.users.update_one(
+                                {"_id": ObjectId(user_id)},
+                                {
+                                    "$set": {
+                                        "lastDonationDate": last_appt['date'],
+                                        "lastDonationType": last_appt.get('type', 'Voluntary')
+                                    }
+                                }
+                            )
+                            # print(f"Self-healed lastDonationDate for {user_id}")
+                        except: pass
+                    
                     # If user profile date is more recent (or no appt yet), use it
-                    if latest_date is None or u_date > latest_date:
+                    elif latest_date is None or u_date > latest_date:
                         latest_date = u_date
-                except:
+                        
+                except Exception as e:
+                    print(f"Date parse error: {e}")
                     pass
+            elif latest_date:
+                # Profile has NO date, but DB does. Update Profile.
+                 try:
+                    db.users.update_one(
+                        {"_id": ObjectId(user_id)},
+                        {
+                            "$set": {
+                                "lastDonationDate": last_appt['date'],
+                                "lastDonationType": last_appt.get('type', 'Voluntary')
+                            }
+                        }
+                    )
+                 except: pass
 
             next_date = "Available Now"
             if latest_date:
