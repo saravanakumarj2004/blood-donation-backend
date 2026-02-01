@@ -2208,13 +2208,51 @@ class DonorIgnoreRequestView(APIView):
         if not user_id or not req_id:
              return Response({"error": "Missing params"}, status=400)
              
-        # Add to ignored list in User Profile
+        # 1. Add to ignored list in User Profile
         db.users.update_one(
             {"_id": ObjectId(user_id)},
             {"$addToSet": {"ignoredRequests": req_id}}
         )
         
-        return Response({"success": True})
+        # 2. Track rejection in the request document
+        result = db.requests.update_one(
+            {"_id": ObjectId(req_id)},
+            {"$addToSet": {"rejectedBy": user_id}}
+        )
+        
+        # 3. Check if ALL notified donors have now rejected
+        req = db.requests.find_one({"_id": ObjectId(req_id)})
+        if req:
+            notified_count = req.get('notifiedDonorCount', 0)
+            rejected_count = len(req.get('rejectedBy', []))
+            
+            # If all donors rejected, update status to 'Rejected'
+            if notified_count > 0 and rejected_count >= notified_count:
+                db.requests.update_one(
+                    {"_id": ObjectId(req_id)},
+                    {"$set": {"status": "Rejected", "rejectedAt": datetime.datetime.now().isoformat()}}
+                )
+                print(f"Request {req_id} auto-rejected: {rejected_count}/{notified_count} donors rejected")
+                
+                # Optional: Send notification to requester
+                try:
+                    requester_id = req.get('requesterId')
+                    if requester_id:
+                        db.notifications.insert_one({
+                            "recipientId": requester_id,
+                            "type": "REQUEST_REJECTED",
+                            "title": "Request Update",
+                            "message": "Unfortunately, no donors were available to help with your request.",
+                            "relatedRequestId": req_id,
+                            "timestamp": datetime.datetime.now().isoformat(),
+                            "status": "UNREAD"
+                        })
+                except Exception as e:
+                    print(f"Failed to notify requester: {e}")
+                
+                return Response({"success": True, "requestStatusChanged": True, "newStatus": "Rejected"})
+        
+        return Response({"success": True, "requestStatusChanged": False})
 
 class DonorP2PView(APIView):
     def get(self, request):
@@ -2241,6 +2279,8 @@ class DonorP2PView(APIView):
         data['createdAt'] = datetime.datetime.now().isoformat()
         data['status'] = 'Active' # Fix: Set to Active so it appears in feeds
         data['type'] = 'P2P_REQUEST'
+        data['rejectedBy'] = []  # Track which donors rejected this request
+        data['notifiedDonorCount'] = 0  # Track how many donors were notified
         
         # 1. Calculate Expiration
         req_time = data.get('requiredTime')
@@ -2263,6 +2303,7 @@ class DonorP2PView(APIView):
             data['expiresAt'] = (now + delta).isoformat()
 
         res = db.requests.insert_one(data)
+        request_id = str(res.inserted_id)
         
         # 2. Notify Potential Donors
         # Find donors in target cities with matching blood group
@@ -2302,6 +2343,13 @@ class DonorP2PView(APIView):
                 if is_eligible:
                     donors.append(doc)
             
+            # **CRITICAL: Store how many donors were notified**
+            notified_count = len(donors)
+            db.requests.update_one(
+                {"_id": res.inserted_id},
+                {"$set": {"notifiedDonorCount": notified_count}}
+            )
+            
             # Send Push
             tokens = [d['fcmToken'] for d in donors if d.get('fcmToken')]
             if tokens:
@@ -2311,7 +2359,7 @@ class DonorP2PView(APIView):
                     f"A peer needs {data.get('bloodGroup')} blood in {data.get('location', 'your area')}.",
                     {
                         "type": "P2P_REQUEST", 
-                        "requestId": str(res.inserted_id)
+                        "requestId": request_id
                     }
                 )
                 
@@ -2323,7 +2371,7 @@ class DonorP2PView(APIView):
                     "type": "P2P_REQUEST",
                     "title": "Peer Request",
                     "message": f"Urgent: {data.get('bloodGroup')} needed.",
-                    "relatedRequestId": str(res.inserted_id),
+                    "relatedRequestId": request_id,
                     "timestamp": datetime.datetime.now().isoformat(),
                     "status": "UNREAD"
                 })
@@ -2332,8 +2380,10 @@ class DonorP2PView(APIView):
                 
         except Exception as e:
             print(f"P2P Notify Error: {e}")
+            import traceback
+            traceback.print_exc()
         
-        return Response({"success": True, "id": str(res.inserted_id)})
+        return Response({"success": True, "id": request_id, "notifiedDonors": notified_count})
 
     def complete_request(self, request):
         db = get_db()
