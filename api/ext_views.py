@@ -111,11 +111,16 @@ class DonorP2PRequestView(APIView):
                         title="Emergency Blood Request",
                         body=notif_msg
                     ),
+                    data={"requestId": req_id, "type": "URGENT_REQUEST"},
                     tokens=fcm_tokens
                 )
-                messaging.send_multicast(msg)
+                # Use correct Firebase Admin SDK method
+                response = messaging.send_each_for_multicast(msg)
+                print(f"FCM Broadcast: {response.success_count}/{len(fcm_tokens)} sent successfully")
             except Exception as e:
                 print(f"FCM Error: {e}")
+                import traceback
+                traceback.print_exc()
 
         return Response({
             "success": True, 

@@ -36,9 +36,14 @@ def send_push_multicast(tokens, title, body, data=None):
             data=data or {},
             tokens=tokens,
         )
-        messaging.send_multicast(message)
+        # Use send_each_for_multicast (correct method for firebase-admin v6+)
+        response = messaging.send_each_for_multicast(message)
+        print(f"Push sent successfully: {response.success_count} succeeded, {response.failure_count} failed")
+        return response
     except Exception as e:
         print(f"Push Error: {e}")
+        import traceback
+        traceback.print_exc()
 
 # Haversine Formula for Distance (km)
 def calculate_distance(lat1, lon1, lat2, lon2):
