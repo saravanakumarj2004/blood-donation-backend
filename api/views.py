@@ -2500,7 +2500,7 @@ class DonorP2PView(APIView):
         if not p2p_request:
             return Response({"error": "Request not found"}, status=404)
         
-        accepted_donor_id = p2p_request.get('acceptedDonorId')
+        accepted_donor_id = p2p_request.get('acceptedDonorId') or p2p_request.get('acceptedBy')
         if not accepted_donor_id:
             return Response({"error": "No donor accepted this request"}, status=400)
         
@@ -2579,12 +2579,13 @@ class AcceptRequestView(APIView):
             if not donor:
                 return Response({"error": "Donor not found"}, status=404)
             
-            # Update request
+            # Update request with standardized 'acceptedBy'
             db.requests.update_one(
                 {"_id": ObjectId(req_id)},
                 {"$set": {
                     "status": "Accepted",
                     "acceptedDonorId": user_id,
+                    "acceptedBy": user_id, # Standardization for legacy compatibility
                     "acceptedAt": datetime.datetime.now().isoformat()
                 }}
             )
