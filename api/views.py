@@ -2134,104 +2134,76 @@ class BloodDispatchView(APIView):
         # Support requestId lookup
         req_id = data.get('reqId') or data.get('requestId')
         
-        target_id = data.get('targetId')
-        units = data.get('units')
-        bg = data.get('bloodGroup')
-        sender_id = data.get('hospitalId')
-        
-        # If Request ID provided, fetch details from it
-        if req_id:
-            req = db.requests.find_one({"_id": ObjectId(req_id)})
-            if not req:
-                 return Response({"error": "Request not found"}, status=404)
-            
-            # Auto-fill missing data from Request
-            if not target_id: target_id = req.get('requesterId')
-            if not units: units = int(req.get('units', 0))
-            if not bg: bg = req.get('bloodGroup')
-            
-            # Update Request Status
-            db.requests.update_one(
-                {"_id": ObjectId(req_id)},
-                {"$set": {
-                    "status": "Dispatched",
-                    "dispatchDetails": {
-                        "mode": data.get('transportMode'),
-                        "tracker": data.get('trackingId'),
-                        "date": data.get('dispatchDate')
-                    }
-                }}
-            )
-
-        # Validation
-        if not sender_id or not target_id or not units or not bg:
-             return Response({"error": "Missing dispatch details (targetId, units, bloodGroup required if no reqId)"}, status=400)
+        if not req_id:
+             return Response({"error": "Request ID required for dispatch"}, status=400)
              
-        # 1. Consume batches using FIFO and get tracking data
-        consumption_result = consume_batches_fifo(db, sender_id, bg, int(units))
+        # Fetch Request
+        req = db.requests.find_one({"_id": ObjectId(req_id)})
+        if not req:
+                return Response({"error": "Request not found"}, status=404)
         
-        # 2. CREATE OUTGOING BATCH CARD for sender hospital
-        outgoing_batch = {
-            "type": "transfer_out",
-            "hospitalId": sender_id,
-            "receivingHospitalId": target_id,
-            "bloodGroup": bg,
-            "quantity": int(units),
-            "transferRequestId": req_id,
-            "sourceBatchIds": consumption_result['source_batches'],
-            "issuedAt": datetime.datetime.now().isoformat(),
-            "dispatchDetails": {
-                "mode": data.get('transportMode'),
-                "tracker": data.get('trackingId'),
-                "date": data.get('dispatchDate')
-            },
-            "createdAt": datetime.datetime.now().isoformat()
-        }
-        db.outgoing_batches.insert_one(outgoing_batch)
-        
-        # 3. CREATE INCOMING BATCH CARD for receiver hospital
-        incoming_batch = {
-            "type": "incoming",
-            "hospitalId": target_id,
-            "bloodGroup": bg,
-            "units": int(units),
-            "collectedDate": datetime.datetime.now().isoformat(),
-            "expiryDate": (datetime.datetime.now() + datetime.timedelta(days=35)).isoformat(),
-            "source": "transfer",
-            "transferRequestId": req_id,
-            "fromHospitalId": sender_id,
-            "createdAt": datetime.datetime.now().isoformat()
-        }
-        db.batches.insert_one(incoming_batch)
-        
-        # 4. Decrement Sender Inventory
-        db.inventory.update_one(
-            {"hospitalId": sender_id},
-            {"$inc": {bg: -int(units)}}
+        # Update Request Status
+        db.requests.update_one(
+            {"_id": ObjectId(req_id)},
+            {"$set": {
+                "status": "Dispatched",
+                "dispatchDetails": {
+                    "mode": data.get('transportMode'),
+                    "tracker": data.get('trackingId'),
+                    "date": data.get('dispatchDate'),
+                    "dispatchedBy": data.get('dispatchedBy')
+                }
+            }}
+        )
+
+        # Update Existing Outgoing Batch Record (Created at Acceptance)
+        # We find it by the unique requestId stored in dispatchDetails
+        update_res = db.outgoing_batches.update_one(
+            {"dispatchDetails.requestId": str(req_id)},
+            {"$set": {
+                "dispatchDetails.mode": data.get('transportMode'),
+                "dispatchDetails.tracker": data.get('trackingId'),
+                "dispatchDetails.date": data.get('dispatchDate'),
+                "dispatchDetails.dispatchedBy": data.get('dispatchedBy'),
+                "status": "Dispatched"
+            }}
         )
         
-        # 5. Increment Receiver Inventory
-        db.inventory.update_one(
-            {"hospitalId": target_id},
-            {"$inc": {bg: int(units)}},
-            upsert=True
-        )
+        if update_res.matched_count == 0:
+            # Fallback: If for some reason the batch wasn't created at Acceptance (Legacy data?), we could create it here.
+            # But for now, we just log warning or ignore. 
+            # Ideally, the Clean Workflow ensures it exists.
+            print(f"Warning: No outgoing batch found for Request {req_id} to update.")
         
-        # 6. Notify Receiver
+        # Notify Receiver
+        target_id = req.get('requesterId')
+        sender_id = req.get('acceptedBy') or req.get('hospitalId') # Responder
+        
         sender_doc = db.users.find_one({"_id": ObjectId(sender_id)})
         sender_name = sender_doc.get('name', 'Partner Hospital') if sender_doc else 'Partner Hospital'
         
         db.notifications.insert_one({
-             "recipientId": target_id,
-             "type": "BLOOD_DISPATCHED",
-             "title": "Blood Received",
-             "message": f"{units} units of {bg} received from {sender_name}.",
-             "reqId": req_id,
-             "status": "UNREAD",
-             "timestamp": datetime.datetime.now().isoformat()
+                "recipientId": target_id,
+                "type": "BLOOD_DISPATCHED",
+                "title": "Blood Dispatched",
+                "message": f"{req.get('units')} units of {req.get('bloodGroup')} dispatched by {sender_name}. Track: {data.get('trackingId')}",
+                "relatedRequestId": str(req_id),
+                "status": "UNREAD",
+                "timestamp": datetime.datetime.now().isoformat()
         })
         
-        return Response({"success": True, "message": "Blood dispatched and batch cards created"})
+        # Send Push
+        recipient_user = db.users.find_one({"_id": ObjectId(target_id)})
+        if recipient_user and recipient_user.get('fcmToken'):
+             send_push_multicast(
+                 [recipient_user['fcmToken']], 
+                 "Blood Dispatched", 
+                 f"Shipment incoming from {sender_name}",
+                 {"type": "BLOOD_DISPATCHED", "requestId": str(req_id)}
+             )
+        
+        return Response({"success": True, "message": "Dispatch details updated successfully"})
+
 
 class BloodReceiveView(APIView):
     def post(self, request):
