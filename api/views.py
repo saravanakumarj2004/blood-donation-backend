@@ -853,6 +853,10 @@ class HospitalRequestsView(APIView):
             dataset['responseMessage'] = data.get('responseMessage')
         
         if new_status == 'Accepted':
+            # GUARD: Prevent Re-Acceptance (Side effects are not idempotent)
+            if req.get('status') == 'Accepted':
+                 return Response({"error": "Request is already accepted."}, status=409)
+
             # 1. EXPIRY CHECK
             if req.get('expiresAt'):
                 try:
