@@ -2555,7 +2555,7 @@ class DonorP2PView(APIView):
                 "read": False
             })
             
-        return Response({"status": "success", "msg": "Request Cancelled Successfully"})_id},
+        return Response({"status": "success", "msg": "Request Cancelled Successfully"})
                 {"$set": {"notifiedDonorCount": notified_count}}
             )
             
