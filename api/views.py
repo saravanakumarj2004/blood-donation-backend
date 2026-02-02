@@ -996,7 +996,7 @@ class HospitalRequestsView(APIView):
                 else:
                     # Emergency/Broadcast: hospitalId is the SOURCE (Need), acceptedBy is the DONOR
                     donor_id = req.get('acceptedBy')
-                    requester_id = req.get('hospitalId')
+                    requester_id = req.get('hospitalId') or req.get('requesterId')
 
                 # Fetch Source/Donor Name for consistent records
                 source_name = "External Source"
