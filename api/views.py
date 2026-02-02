@@ -363,8 +363,8 @@ class DonorStatsView(APIView):
 
             next_date = "Available Now"
             if latest_date:
-                # 60 Days Rule (User requested 60 days)
-                eligible_date = latest_date + datetime.timedelta(days=60)
+                # 120 Days Rule (User requested 4 months)
+                eligible_date = latest_date + datetime.timedelta(days=120)
                 now_utc = datetime.datetime.now(datetime.timezone.utc)
                 
                 # Make eligible_date offset-aware if it isn't
