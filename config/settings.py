@@ -91,15 +91,6 @@ DATABASES = {
     }
 }
 
-# Disable migrations for builtin apps we don't use via SQL
-MIGRATION_MODULES = {
-    'auth': None,
-    'contenttypes': None,
-    'admin': None,
-    'sessions': None,
-    'messages': None,
-}
-
 # Password validation
 # https://docs.djangoproject.com/en/6.0/ref/settings/#auth-password-validators
 
