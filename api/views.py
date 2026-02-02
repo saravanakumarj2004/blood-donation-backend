@@ -599,7 +599,9 @@ class HospitalRequestsView(APIView):
             outgoing_query = {
                 "$or": [
                     {"requesterId": user_id},
-                    {"hospitalId": user_id, "type": {"$ne": "P2P"}} 
+                    # Fix: Only include requests where I am hospitalId IF it is a Broadcast/Emergency.
+                    # For P2P/StockTransfer, hospitalId is the TARGET (Incoming), so exclude those.
+                    {"hospitalId": user_id, "type": "EMERGENCY_ALERT"} 
                 ]
             }
             if search_term:
@@ -920,6 +922,28 @@ class HospitalRequestsView(APIView):
                 # CRITICAL: Also Consume Batches (Physical Stock) to match Inventory
                 # This prevents "Double Spending" of the same blood units
                 consumption_result = consume_batches_fifo(db, responder_id, bg, units)
+                
+                # Create Outgoing Batch Record for Sender (Responder)
+                # This ensures it shows up in "Outgoing Batches" UI
+                try:
+                    outgoing_batch_data = {
+                        "type": "transfer", # Distinct from 'patient_usage'
+                        "hospitalId": responder_id, # Sender
+                        "receivingHospitalId": req.get('requesterId', 'Unknown'), # Receiver
+                        "bloodGroup": bg,
+                        "quantity": units,
+                        "issuedAt": datetime.datetime.now().isoformat(),
+                        "status": "Transferred",
+                        "sourceBatchIds": consumption_result.get('source_batches', []),
+                        "dispatchDetails": {
+                            "requestId": str(req['_id']),
+                            "tracker": f"TRK-{str(req['_id'])[-6:].upper()}"
+                        },
+                        "createdAt": datetime.datetime.now().isoformat()
+                    }
+                    db.outgoing_batches.insert_one(outgoing_batch_data)
+                except Exception as e:
+                    print(f"Failed to create outgoing batch record: {e}")
 
 
         if new_status == 'Cancelled' and current_status == 'Accepted':
