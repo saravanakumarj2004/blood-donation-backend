@@ -219,7 +219,7 @@ class LoginView(APIView):
                 print("CRITICAL: Database connection failed (db is None)")
                 return Response({"error": "Database Service Unavailable"}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
 
-            email = request.data.get('email')
+            email = request.data.get('email', '').strip().lower()
             password = request.data.get('password')
             fcm_token = request.data.get('fcmToken') # Capture Token on Login
             
@@ -612,10 +612,16 @@ class HospitalRequestsView(APIView):
             my_requests = list(db.requests.find(outgoing_query).sort("date", -1))
 
         # 2. Fetch Incoming (If needed)
+        # Fix: Show "P2P" AND "StockTransfer" as Incoming for target hospital.
+        # Fix: Ensure we don't show our own requests as "Incoming" (requesterId != user_id)
         if filter_type in ['all', 'received']:
              incoming_query = {
                 "$or": [
-                    {"hospitalId": user_id, "type": "P2P"}, 
+                    {
+                        "hospitalId": user_id, 
+                        "type": {"$in": ["P2P", "StockTransfer"]},
+                        "requesterId": {"$ne": user_id}  # Block self-requests from appearing as incoming
+                    }, 
                     {"type": "EMERGENCY_ALERT", "requesterId": {"$ne": user_id}} 
                 ]
             }
@@ -966,10 +972,19 @@ class HospitalRequestsView(APIView):
 
                 # Fetch Source/Donor Name for consistent records
                 source_name = "External Source"
+                donor_details = {}
+                
                 if donor_id:
                      donor_obj = db.users.find_one({"_id": ObjectId(donor_id)})
                      if donor_obj:
                          source_name = donor_obj.get('name', 'Unknown')
+                         donor_details = {
+                             "donorId": str(donor_obj['_id']),
+                             "name": donor_obj.get('name'),
+                             "email": donor_obj.get('email'),
+                             "phone": donor_obj.get('phone'),
+                             "bloodGroup": donor_obj.get('bloodGroup')
+                         }
 
                 # 1. Increment Stock for Requester (They received it)
                 if requester_id and bg:
@@ -989,6 +1004,7 @@ class HospitalRequestsView(APIView):
                             "expiryDate": (datetime.datetime.now() + datetime.timedelta(days=35)).isoformat(),
                             "sourceType": "Transfer" if req_type in ['P2P', 'StockTransfer'] else "Donation",
                             "sourceName": source_name,
+                            "donorDetails": donor_details, # Added detailed info
                             "location": "Incoming Setup", 
                             "createdAt": datetime.datetime.now().isoformat(),
                             "status": "Active"
@@ -1291,6 +1307,12 @@ class HospitalAppointmentsView(APIView):
                             "expiryDate": (datetime.datetime.now() + datetime.timedelta(days=35)).isoformat(), # Default 35 days
                             "sourceType": "Donation",
                             "sourceName": donor.get('name') if donor else "Walk-in Donor",
+                            "donorDetails": {
+                                "donorId": str(donor['_id']) if donor else None,
+                                "name": donor.get('name') if donor else "Walk-in",
+                                "email": donor.get('email') if donor else None,
+                                "phone": donor.get('phone') if donor else None,
+                            },
                             "location": "In-House",
                             "createdAt": datetime.datetime.now().isoformat(),
                             "status": "Active"
