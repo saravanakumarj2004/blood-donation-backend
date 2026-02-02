@@ -8,7 +8,7 @@ from .views import (
     BatchView, BatchActionView, OutgoingBatchView,
     HospitalReportsView, BloodDispatchView, BloodReceiveView,
     DonorIgnoreRequestView, DonorP2PView, AcceptRequestView,
-    DonorProfileView, FCMTokenView
+    DonorProfileView, FCMTokenView, EligibilityView
 )
 
 urlpatterns = [
@@ -55,10 +55,11 @@ urlpatterns = [
     path('donor/accept-request/', AcceptRequestView.as_view(), name='donor-accept-request'),  # NEW
     path('donor/my-requests/', DonorP2PView.as_view(), name='donor-my-requests'),
     path('donor/requests/', DonorP2PView.as_view(), name='donor-create-request'),
+    path('donor/requests/cancel/', DonorP2PView.as_view(), name='donor-cancel-request'),
     path('donor/requests/complete/', DonorP2PView.as_view(), name='donor-complete-request'),
 
     # App Specific
     path('donor/profile/', DonorProfileView.as_view(), name='donor-profile'),
     path('fcm/token/', FCMTokenView.as_view(), name='fcm-token'),
-    # path('donor/eligibility/', EligibilityView.as_view()),  # TODO: Implement EligibilityView
+    path('donor/eligibility/', EligibilityView.as_view(), name='donor-eligibility'),
 ]

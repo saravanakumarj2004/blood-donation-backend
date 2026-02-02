@@ -2422,6 +2422,9 @@ class DonorP2PView(APIView):
         # Check if this is a 'complete' action or 'create'
         if 'requestId' in data and request.path.endswith('complete/'):
              return self.complete_request(request)
+             
+        if 'requestId' in data and request.path.endswith('cancel/'):
+             return self.cancel_request(request)
 
         # Create Logic
         data['createdAt'] = datetime.datetime.now().isoformat()
@@ -2495,6 +2498,64 @@ class DonorP2PView(APIView):
             notified_count = len(donors)
             db.requests.update_one(
                 {"_id": res.inserted_id},
+                {"$set": {"notifiedDonorCount": notified_count}}
+            )
+
+            # Send FCM to donors
+            # (FCM Logic omitted for brevity, assumed handled by separate service or cron)
+
+            return Response({
+                "status": "success", 
+                "msg": f"Request Broadcasted to {notified_count} donors!", 
+                "requestId": request_id,
+                "notifiedCount": notified_count
+            })
+        except Exception as e:
+            print(f"Error creating request: {e}")
+            return Response({"status": "error", "msg": str(e)}, status=500)
+
+    def cancel_request(self, request):
+        """Cancel a P2P Request"""
+        db = get_db()
+        data = request.data
+        request_id = data.get('requestId')
+        user_id = data.get('userId')
+        
+        if not request_id or not user_id:
+             return Response({"status": "error", "msg": "Missing requestId or userId"}, status=400)
+
+        # 1. Verify Ownership
+        req = db.requests.find_one({"_id": ObjectId(request_id)})
+        if not req:
+             return Response({"status": "error", "msg": "Request not found"}, status=404)
+        
+        if str(req.get('requesterId')) != str(user_id):
+             return Response({"status": "error", "msg": "Unauthorized"}, status=403)
+
+        if req.get('status') == 'Cancelled':
+             return Response({"status": "error", "msg": "Request is already cancelled"})
+             
+        # 2. Update Status
+        db.requests.update_one(
+            {"_id": ObjectId(request_id)},
+            {"$set": {"status": "Cancelled", "cancelledAt": datetime.datetime.now().isoformat()}}
+        )
+        
+        # 3. Notify Accepted Donor (if any)
+        # If someone had accepted it, they need to know it's off.
+        accepted_donor_id = req.get('acceptedDonorId')
+        if accepted_donor_id:
+            # Create a notification for the donor
+            db.notifications.insert_one({
+                "userId": accepted_donor_id,
+                "title": "Request Cancelled",
+                "message": f"The blood request from {req.get('hospitalName', 'Unknown')} has been cancelled by the requester.",
+                "type": "info",
+                "date": datetime.datetime.now().isoformat(),
+                "read": False
+            })
+            
+        return Response({"status": "success", "msg": "Request Cancelled Successfully"})_id},
                 {"$set": {"notifiedDonorCount": notified_count}}
             )
             
