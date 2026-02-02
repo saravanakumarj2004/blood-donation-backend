@@ -2556,43 +2556,7 @@ class DonorP2PView(APIView):
             })
             
         return Response({"status": "success", "msg": "Request Cancelled Successfully"})
-                {"$set": {"notifiedDonorCount": notified_count}}
-            )
-            
-            # Send Push
-            tokens = [d['fcmToken'] for d in donors if d.get('fcmToken')]
-            if tokens:
-                send_push_multicast(
-                    tokens, 
-                    "Urgent Blood Request", 
-                    f"A peer needs {data.get('bloodGroup')} blood in {data.get('location', 'your area')}.",
-                    {
-                        "type": "P2P_REQUEST", 
-                        "requestId": request_id
-                    }
-                )
-                
-            # Create In-App Notifications
-            notifs = []
-            for d in donors:
-                notifs.append({
-                    "recipientId": str(d['_id']),
-                    "type": "P2P_REQUEST",
-                    "title": "Peer Request",
-                    "message": f"Urgent: {data.get('bloodGroup')} needed.",
-                    "relatedRequestId": request_id,
-                    "timestamp": datetime.datetime.now().isoformat(),
-                    "status": "UNREAD"
-                })
-            if notifs:
-                db.notifications.insert_many(notifs)
-                
-        except Exception as e:
-            print(f"P2P Notify Error: {e}")
-            import traceback
-            traceback.print_exc()
-        
-        return Response({"success": True, "id": request_id, "notifiedDonors": notified_count})
+
 
     def complete_request(self, request):
         """Mark P2P request as completed and update donor's stats"""
