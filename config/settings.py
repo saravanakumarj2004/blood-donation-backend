@@ -51,8 +51,8 @@ INSTALLED_APPS = [
     'chatbot',  # AI-powered chatbot
 ]
 
-# OpenAI Configuration
-OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', '')
+# Google Gemini Configuration (FREE!)
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', '')
 
 MIDDLEWARE = [
     'corsheaders.middleware.CorsMiddleware',

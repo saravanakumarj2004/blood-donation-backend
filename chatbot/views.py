@@ -4,7 +4,7 @@ from rest_framework.response import Response
 from rest_framework import status
 from django.db import models
 from .models import ChatConversation, ChatMessage, ChatAnalytics
-from .openai_service import get_ai_response, build_user_context, parse_function_call
+from .gemini_service import get_ai_response, build_user_context, parse_function_call
 import time
 from django.utils import timezone
 
