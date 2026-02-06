@@ -1,7 +1,7 @@
 from google import genai
 from google.genai import types
 from django.conf import settings
-from api.mongo_db import get_db
+from api.db import get_db
 from datetime import datetime, timedelta
 import json
 
