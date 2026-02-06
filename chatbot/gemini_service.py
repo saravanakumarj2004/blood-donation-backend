@@ -133,7 +133,7 @@ def build_user_context(user):
                 next_eligible_date = last_date + timedelta(days=56)
                 
                 context_parts.append(f"Last Donation: {days_since} days ago ({last_date.strftime('%B %d, %Y')})")
-                context_parts.append(f"Currently Eligible: {'Yes' if eligible else f'No (eligible on {next_eligible_date.strftime('%B %d, %Y')})'}")
+                context_parts.append(f"Currently Eligible: {'Yes' if eligible else f'No (eligible on {next_eligible_date.strftime(\"%B %d, %Y\")})'}")
                 
                 lives_saved = donation_count * 3
                 context_parts.append(f"Estimated Lives Saved: {lives_saved}")
