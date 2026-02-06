@@ -1,14 +1,12 @@
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from django.conf import settings
-from api.models import DonorProfile, DonationHistory
+from api.mongo_db import get_db
 from datetime import datetime, timedelta
 import json
 
-# Configure Gemini
-genai.configure(api_key=settings.GEMINI_API_KEY)
-
-# Initialize Gemini model
-model = genai.GenerativeModel('gemini-1.5-flash')
+# Configure Gemini with new API
+client = genai.Client(api_key=settings.GEMINI_API_KEY)
 
 SYSTEM_PROMPT = """You are LifeLink Assistant, an AI helper for a blood donation mobile app.
 
@@ -28,17 +26,67 @@ Help users with blood donation questions, guide them through the app, and encour
 **USER CONTEXT:**
 {user_context}
 
-**AVAILABLE APP FEATURES:**
-- Book Appointment: Schedule blood donation at hospitals
-- Find Donors: Search for donors by blood type and location
-- Check Eligibility: Interactive eligibility quiz
-- View History: See past donations and track impact
+**APP WORKFLOW GUIDES:**
+
+1. **Book Appointment:**
+   - Tap "Book Appointment" on Dashboard
+   - Select hospital from list or search by location
+   - Choose available date and time slot
+   - Review details and tap "Confirm Booking"
+   - Receive confirmation notification
+
+2. **Find Blood Donors:**
+   - Tap "Find Donors" on Dashboard
+   - Select required blood type (A+, B+, O+, AB+, A-, B-, O-, AB-)
+   - Enter location or use current location
+   - View donors sorted by proximity
+   - Tap "Request Blood" to contact donor
+
+3. **Create Donor Request:**
+   - Tap "+" button or "Create Request" on Dashboard
+   - Fill in patient details, blood type, units needed
+   - Add hospital location and urgency level
+   - Set alert zones (cities to notify donors)
+   - Submit request to notify nearby donors
+
+4. **Check Eligibility:**
+   - Tap "Check Eligibility" from menu or chatbot
+   - Answer health screening questions honestly
+   - View eligibility result (Yes/No) with explanation
+   - If eligible, proceed to book appointment directly
+
+5. **View Donation History:**
+   - Go to "History" tab from bottom navigation
+   - See all past donations with dates and locations
+   - Tap any donation to view digital certificate
+   - Tap "Share" to download or share certificate
+
+6. **Edit Profile:**
+   - Go to "Profile" tab from bottom navigation
+   - Tap "Edit Profile" button in top right
+   - Update name, phone, blood group, location
+   - Add/update avatar, bio, occupation (optional)
+   - Tap "Save Changes" to update
+
+7. **Manage Notifications:**
+   - Go to "Profile" → "Settings" (gear icon)
+   - Tap "Notification Preferences"
+   - Toggle on/off: Blood requests, Appointment reminders, Impact updates
+   - Select alert zones (cities for urgent blood request notifications)
+   - Save preferences
+
+8. **View Impact Stats:**
+   - Go to "Profile" tab
+   - Scroll to "Your Impact" section
+   - See total donations, lives saved estimate, impact chart
+   - View personal milestones and achievements
 
 **RESPONSE GUIDELINES:**
 - Be warm, encouraging, and professional
-- Keep responses under 80 words for mobile readability
+- Keep responses under 100 words for mobile readability
 - Use emojis sparingly (❤️ 🩸 ✨ only when appropriate)
-- If user wants to book/search, suggest "Use the buttons below" instead of describing actions
+- When describing workflows, mention the EXACT screen/button names
+- If user wants to perform an action, suggest using the feature and add action trigger
 - Personalize based on user context when available
 - Always be supportive and celebrate their life-saving contributions
 
@@ -50,38 +98,52 @@ Help users with blood donation questions, guide them through the app, and encour
 **TONE:** Friendly professional who celebrates every donor as a hero."""
 
 def build_user_context(user):
-    """Build personalized context from user's profile and donation history"""
+    """Build personalized context from MongoDB user data"""
     try:
-        profile = DonorProfile.objects.get(user=user)
-        donations = DonationHistory.objects.filter(donor=user).order_by('-date')
-        donation_count = donations.count()
+        db = get_db()
+        
+        # Get user profile from MongoDB
+        profile = db.donor_profiles.find_one({"user_id": user.id})
+        if not profile:
+            return "New user - Profile incomplete (encourage profile completion)"
+        
+        # Get donation history from MongoDB
+        donations = list(db.donation_history.find(
+            {"donor_id": user.id}
+        ).sort("date", -1))
+        
+        donation_count = len(donations)
         
         context_parts = [
-            f"Name: {profile.name}",
-            f"Blood Group: {profile.blood_group}",
+            f"Name: {profile.get('name', 'User')}",
+            f"Blood Group: {profile.get('blood_group', 'Not set')}",
             f"Total Donations: {donation_count}",
         ]
         
-        if donations.exists():
-            last_donation = donations.first()
-            days_since = (datetime.now().date() - last_donation.date).days
-            eligible = days_since >= 56
-            next_eligible_date = last_donation.date + timedelta(days=56)
+        if donations:
+            last_donation = donations[0]
+            last_date = last_donation.get('date')
             
-            context_parts.append(f"Last Donation: {days_since} days ago ({last_donation.date})")
-            context_parts.append(f"Currently Eligible: {'Yes' if eligible else f'No (eligible on {next_eligible_date})'}")
-            
-            lives_saved = donation_count * 3
-            context_parts.append(f"Estimated Lives Saved: {lives_saved}")
+            if last_date:
+                if isinstance(last_date, str):
+                    last_date = datetime.fromisoformat(last_date.replace('Z', '+00:00'))
+                
+                days_since = (datetime.now() - last_date).days
+                eligible = days_since >= 56
+                next_eligible_date = last_date + timedelta(days=56)
+                
+                context_parts.append(f"Last Donation: {days_since} days ago ({last_date.strftime('%B %d, %Y')})")
+                context_parts.append(f"Currently Eligible: {'Yes' if eligible else f'No (eligible on {next_eligible_date.strftime('%B %d, %Y')})'}")
+                
+                lives_saved = donation_count * 3
+                context_parts.append(f"Estimated Lives Saved: {lives_saved}")
         else:
             context_parts.append("Status: First-time donor (no previous donations)")
             context_parts.append("Currently Eligible: Likely yes (pending screening)")
         
         return "\n".join(context_parts)
     
-    except DonorProfile.DoesNotExist:
-        return "New user - Profile incomplete (encourage profile completion)"
-    except Exception:
+    except Exception as e:
         return "Limited profile data available"
 
 
@@ -102,14 +164,15 @@ def get_ai_response(user_message, user_context, conversation_history=[]):
     full_prompt = f"{chat_context}\n\nUser: {user_message}\nAssistant:"
     
     try:
-        # Call Gemini API (FREE!)
-        response = model.generate_content(
-            full_prompt,
-            generation_config={
-                'temperature': 0.7,
-                'max_output_tokens': 200,
-                'top_p': 0.9,
-            }
+        # Call Gemini API with new SDK
+        response = client.models.generate_content(
+            model='gemini-2.0-flash-exp',
+            contents=full_prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.7,
+                max_output_tokens=250,
+                top_p=0.9,
+            )
         )
         
         message_text = response.text.strip()
@@ -135,10 +198,11 @@ def get_ai_response(user_message, user_context, conversation_history=[]):
             "content": message_text,
             "function_call": function_call,
             "role": "assistant",
-            "usage": {"total_tokens": 0}  # Gemini free tier doesn't expose token count
+            "usage": {"total_tokens": 0}
         }
     
     except Exception as e:
+        print(f"Gemini API Error: {str(e)}")
         return {
             "content": "I'm having trouble connecting right now. Please try asking again, or use the quick actions below to navigate the app directly.",
             "role": "assistant",
