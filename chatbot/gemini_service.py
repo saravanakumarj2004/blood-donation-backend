@@ -6,7 +6,20 @@ from datetime import datetime, timedelta
 import json
 
 # Configure Gemini with new API
-client = genai.Client(api_key=settings.GEMINI_API_KEY)
+_client = None
+
+def get_gemini_client():
+    global _client
+    if _client is None:
+        if not settings.GEMINI_API_KEY:
+            print("WARNING: GEMINI_API_KEY is not set in settings.")
+            return None
+        try:
+            _client = genai.Client(api_key=settings.GEMINI_API_KEY)
+        except Exception as e:
+            print(f"Error initializing Gemini client: {e}")
+            return None
+    return _client
 
 SYSTEM_PROMPT = """You are LifeLink Assistant, an AI helper for a blood donation mobile app.
 
@@ -169,13 +182,23 @@ def get_ai_response(user_message, user_context, conversation_history=[]):
     full_prompt = f"{chat_context}\n\nUser: {user_message}\nAssistant:"
     
     try:
+        # Get Gemini client safely
+        client = get_gemini_client()
+        if not client:
+            return {
+                "content": "I'm having trouble connecting to my AI core right now. This usually happens if the API key is missing. Please check the server configuration!",
+                "role": "assistant",
+                "function_call": None,
+                "usage": {"total_tokens": 0}
+            }
+
         # Call Gemini API with new SDK
         response = client.models.generate_content(
-            model='gemini-2.0-flash-exp',
+            model='gemini-1.5-flash',
             contents=full_prompt,
             config=types.GenerateContentConfig(
                 temperature=0.7,
-                max_output_tokens=250,
+                max_output_tokens=500,
                 top_p=0.9,
             )
         )

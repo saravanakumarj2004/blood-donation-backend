@@ -110,6 +110,9 @@ def ask_chatbot(request):
             status=status.HTTP_404_NOT_FOUND
         )
     except Exception as e:
+        import traceback
+        print(f"Chatbot Exception: {str(e)}")
+        print(traceback.format_exc())
         return Response(
             {'error': f'Server error: {str(e)}'},
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
