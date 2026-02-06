@@ -48,7 +48,11 @@ INSTALLED_APPS = [
     'corsheaders',
     # Local
     'api',
+    'chatbot',  # AI-powered chatbot
 ]
+
+# OpenAI Configuration
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', '')
 
 MIDDLEWARE = [
     'corsheaders.middleware.CorsMiddleware',

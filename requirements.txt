@@ -7,3 +7,4 @@ python-dotenv
 gunicorn
 whitenoise
 dj-database-url
+openai>=1.0.0
