@@ -48,11 +48,9 @@ INSTALLED_APPS = [
     'corsheaders',
     # Local
     'api',
-    'chatbot',  # AI-powered chatbot
+    # Local
+    'api',
 ]
-
-# Google Gemini Configuration (FREE!)
-GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', '')
 
 MIDDLEWARE = [
     'corsheaders.middleware.CorsMiddleware',
