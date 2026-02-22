@@ -1,18 +1,19 @@
-from rest_framework.views import APIView
-from rest_framework.response import Response
-from rest_framework import status
-from .db import get_db
-from .auth_utils import authenticate_request, require_role
-from bson import ObjectId
+from rest_framework.views import APIView # type: ignore
+from rest_framework.response import Response # type: ignore
+from rest_framework import status # type: ignore
+from .db import get_db # type: ignore
+from .auth_utils import authenticate_request, require_role # type: ignore
+from bson import ObjectId # type: ignore
 import datetime
 import math
-import jwt
+import jwt # type: ignore
 import os
-from django.conf import settings
+from django.conf import settings # type: ignore
+from typing import Any
 
 # Firebase Imports
-import firebase_admin
-from firebase_admin import credentials, messaging
+import firebase_admin # type: ignore
+from firebase_admin import credentials, messaging # type: ignore
 
 # Initialize Firebase App (Lazy Singleton)
 try:
@@ -56,9 +57,9 @@ def calculate_distance(lat1, lon1, lat2, lon2):
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return R * c
 
-def serialize_doc(doc):
+def serialize_doc(doc: Any) -> Any:
     if not doc:
-        return None
+        return {}
     doc['id'] = str(doc['_id'])
     del doc['_id']
     if 'password' in doc:
@@ -188,7 +189,7 @@ class RegisterView(APIView):
             return Response({"error": "Email already exists"}, status=status.HTTP_409_CONFLICT)
             
         # Hash Password (Simple Logic for Demo - Production use Django Auth)
-        from django.contrib.auth.hashers import make_password
+        from django.contrib.auth.hashers import make_password # type: ignore
         data['password'] = make_password(data['password'])
         
         data['createdAt'] = datetime.datetime.now().isoformat()
@@ -208,7 +209,7 @@ class RegisterView(APIView):
             "userId": str(result.inserted_id)
         }, status=status.HTTP_201_CREATED)
 
-from rest_framework.permissions import AllowAny
+from rest_framework.permissions import AllowAny # type: ignore
 
 class LoginView(APIView):
     permission_classes = [AllowAny]
@@ -228,7 +229,7 @@ class LoginView(APIView):
             if not user:
                 return Response({"error": "Invalid credentials"}, status=status.HTTP_401_UNAUTHORIZED)
                 
-            from django.contrib.auth.hashers import check_password
+            from django.contrib.auth.hashers import check_password # type: ignore
             # Support both hashed and legacy headers
             try:
                 is_valid = check_password(password, user['password'])
@@ -515,7 +516,7 @@ class BloodInventoryView(APIView):
         if not user_id:
              return Response({"error": "userId required"}, status=400)
              
-        inventory = db.inventory.find_one({"hospitalId": user_id}) or {}
+        inventory: dict[str, Any] = db.inventory.find_one({"hospitalId": user_id}) or {}
         
         # Lazy Sync: Check for expired batches and update inventory
         try:
@@ -547,14 +548,14 @@ class BloodInventoryView(APIView):
                         print(f"Expired Batch {batch['_id']}: Removed {qty} units of {bg}")
                 
                 # Re-fetch inventory after updates
-                inventory = db.inventory.find_one({"hospitalId": user_id}) or {}
+                inventory: dict[str, Any] = db.inventory.find_one({"hospitalId": user_id}) or {}
         except Exception as e:
             print(f"Batch Expiry Sync Error: {e}")
 
         # Logic: Determine Status on Backend
         items = []
         for bg in ['A+', 'A-', 'B+', 'B-', 'O+', 'O-', 'AB+', 'AB-']:
-            count = inventory.get(bg, 0)
+            count = inventory.get(bg, 0) # type: ignore
             status_label = "Good"
             if count < 5:
                 status_label = "Critical"
@@ -582,8 +583,6 @@ class BloodInventoryView(APIView):
         return Response({"success": True})
 
 class HospitalRequestsView(APIView):
-    def get(self, request):
-        db = get_db()
     def get(self, request):
         db = get_db()
         user_id = request.query_params.get('userId')
@@ -671,37 +670,6 @@ class HospitalRequestsView(APIView):
             final_results = [serialize_doc(req) for req in combined]
             
         return Response(final_results)
-
-        requests = []
-        
-        # Process My Requests (Outgoing)
-        for req in my_requests_cursor:
-            req['isOutgoing'] = True
-            if req.get('acceptedBy'):
-                donor = db.users.find_one({"_id": ObjectId(req['acceptedBy'])})
-                req['donorName'] = donor.get('name') if donor else "Unknown Donor"
-            
-            requests.append(serialize_doc(req))
-            
-        # Process Incoming Requests (Incoming)
-        for req in incoming_list:
-            req['isOutgoing'] = False
-            
-            # If accepted by someone else, hide it (unless I accepted it)
-            if req.get('acceptedBy') and req.get('acceptedBy') != user_id:
-                continue 
-
-            # Fetch Requester Name (Who is asking?)
-            # If P2P, requesterId is the source. If Emergency, requesterId/hospitalId is source.
-            requester_id = req.get('requesterId') or req.get('hospitalId')
-            if requester_id:
-                requester = db.users.find_one({"_id": ObjectId(requester_id)})
-                req['hospitalName'] = requester.get('name') if requester else "Unknown Hospital"
-                req['location'] = requester.get('location') if requester else "Unknown"
-            
-            requests.append(serialize_doc(req))
-            
-        return Response(requests)
         
     def post(self, request):
         db = get_db()
@@ -842,7 +810,8 @@ class HospitalRequestsView(APIView):
              return Response({"error": "Request not found"}, status=404)
              
         # GUARD: Immutability check
-        if req.get('status') == 'Completed':
+        current_status = req.get('status', '')
+        if current_status == 'Completed':
              return Response({"error": "Cannot modify a completed request"}, status=status.HTTP_409_CONFLICT)
 
         # Update Request
@@ -941,7 +910,7 @@ class HospitalRequestsView(APIView):
                         "sourceBatchIds": consumption_result.get('source_batches', []),
                         "dispatchDetails": {
                             "requestId": str(req['_id']),
-                            "tracker": f"TRK-{str(req['_id'])[-6:].upper()}"
+                            "tracker": f"TRK-{str(req['_id'])[-6:].upper()}" # type: ignore
                         },
                         "createdAt": datetime.datetime.now().isoformat()
                     }
@@ -1164,7 +1133,7 @@ class ActiveRequestsView(APIView):
             try:
                 user = db.users.find_one({"_id": ObjectId(user_id)})
                 if user and user.get('ignoredRequests'):
-                     ignored_ids = set(user['ignoredRequests'])
+                     ignored_ids = set(user['ignoredRequests']) # type: ignore
             except:
                 pass
             
@@ -1177,7 +1146,7 @@ class ActiveRequestsView(APIView):
         
         for r in requests:
             # 0. Check Ignored
-            if str(r['_id']) in ignored_ids:
+            if str(r['_id']) in ignored_ids: # type: ignore
                 continue
             # Check Expiry if exists
             if r.get('expiresAt'):
@@ -1193,8 +1162,8 @@ class ActiveRequestsView(APIView):
                      pass # If bad date, ignore expiry check or safe fail
             
             # 2. Strict Blood Group Match
-            if user and user.get('bloodGroup'):
-                if r.get('bloodGroup') != user['bloodGroup']:
+            if user and user.get('bloodGroup'): # type: ignore
+                if r.get('bloodGroup') != user['bloodGroup']: # type: ignore
                     continue
 
             # Populate Requester Details (name, all form fields)
@@ -1399,17 +1368,17 @@ class NotificationView(APIView):
         """Update notification status (Read/Accepted)"""
         db = get_db()
         notif_id = request.data.get('id')
-        status = request.data.get('status')
+        notif_status = request.data.get('status')
         
         # 1. Update Notification
         result = db.notifications.find_one_and_update(
             {"_id": ObjectId(notif_id)},
-            {"$set": {"status": status}},
+            {"$set": {"status": notif_status}},
             return_document=True
         )
         
         # 2. If Accepted, update the original Request/Alert
-        if status == 'ACCEPTED' and result and result.get('relatedRequestId'):
+        if notif_status == 'ACCEPTED' and result and result.get('relatedRequestId'):
             req_id = result.get('relatedRequestId')
             recipient_id = result.get('recipientId') # The donor
             
@@ -1479,12 +1448,12 @@ class AlertResponseView(APIView):
         data = request.data
         alert_id = data.get('alertId')
         donor_id = data.get('donorId')
-        status = data.get('status') # 'Accepted' or 'Declined'
+        alert_status = data.get('status') # 'Accepted' or 'Declined'
         
         if not alert_id or not donor_id:
             return Response({"error": "Missing data"}, status=400)
             
-        if status == 'Accepted':
+        if alert_status == 'Accepted':
             # 1. Fetch Request to check current status
             req = db.requests.find_one({"_id": ObjectId(alert_id)})
             if not req:
@@ -1561,7 +1530,7 @@ class LocationCountView(APIView):
         blood_group = request.query_params.get('bloodGroup')
         cities = request.query_params.getlist('city') # Support multiple cities
         
-        query = {"role": "donor"}
+        query: dict[str, Any] = {"role": "donor"}
         if blood_group:
             query["bloodGroup"] = blood_group
         
@@ -1600,7 +1569,7 @@ class HospitalDonorSearchView(APIView):
         blood_group = request.query_params.get('bloodGroup')
         cities = request.query_params.getlist('city')
         
-        query = {"role": "donor"}
+        query: dict[str, Any] = {"role": "donor"}
         
         # 1. Strict Server-Side Filtering
         if blood_group:
@@ -1685,7 +1654,7 @@ class ProfileUpdateView(APIView):
             if len(pwd) < 6:
                  return Response({"error": "Password must be at least 6 characters"}, status=400)
                  
-            from django.contrib.auth.hashers import make_password
+            from django.contrib.auth.hashers import make_password # type: ignore
             update_fields['password'] = make_password(pwd)
             
         # Handle other fields (Gender, Name, Bio, etc.)
@@ -2264,7 +2233,7 @@ class ForgotPasswordView(APIView):
     3. POST with email + newPassword + verified=True → Resets password
     """
     def post(self, request):
-        from django.contrib.auth.hashers import make_password, check_password
+        from django.contrib.auth.hashers import make_password, check_password # type: ignore
         
         email = request.data.get('email', '').strip()
         security_answer = request.data.get('securityAnswer', '').strip()
@@ -2453,11 +2422,7 @@ class DonorP2PView(APIView):
             
             data['expiresAt'] = (now + delta).isoformat()
 
-        res = db.requests.insert_one(data)
-        request_id = str(res.inserted_id)
-        
-        # 2. Notify Potential Donors
-        # Find donors in target cities with matching blood group
+        # 2. Check for Eligible Donors BEFORE Creating Request
         try:
             query = {
                 "role": "donor",
@@ -2496,10 +2461,17 @@ class DonorP2PView(APIView):
             
             # **CRITICAL: Store how many donors were notified**
             notified_count = len(donors)
-            db.requests.update_one(
-                {"_id": res.inserted_id},
-                {"$set": {"notifiedDonorCount": notified_count}}
-            )
+            
+            # Block request if 0 donors found
+            if notified_count == 0:
+                return Response({
+                    "status": "error", 
+                    "error": "No eligible donors found in the selected city. Broadcast blocked."
+                }, status=400)
+
+            data['notifiedDonorCount'] = notified_count
+            res = db.requests.insert_one(data)
+            request_id = str(res.inserted_id)
 
             # Send FCM to donors
             # (FCM Logic omitted for brevity, assumed handled by separate service or cron)

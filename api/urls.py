@@ -1,5 +1,5 @@
-from django.urls import path
-from .views import (
+from django.urls import path # type: ignore
+from .views import ( # type: ignore
     RegisterView, LoginView, ForgotPasswordView,
     DonorStatsView, DonationHistoryView, BloodInventoryView, HospitalRequestsView, HospitalSearchView,
     ActiveRequestsView, HospitalListView, HospitalAppointmentsView, 
